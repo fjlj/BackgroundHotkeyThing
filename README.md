@@ -9,6 +9,6 @@ BackgroundHotkeyThing.exe <path to png files>
 ```
 
 # Hotkeys
-Win-Z - toggle show/hide desktop icons
-Win+Shift-N - Set next Background
-Win+Shift-B - Set previous Background
+- Win-Z - toggle show/hide desktop icons
+- Win+Shift-N - Set next Background
+- Win+Shift-B - Set previous Background
