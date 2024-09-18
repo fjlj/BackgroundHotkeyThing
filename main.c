@@ -75,10 +75,12 @@ int main(int argc, char *argv[]) {
 	char **prev = malloc(MAX_HISTORY+1*sizeof(char*));
 
 	char relpath[MAX_PATH] = {0};
+	memcpy(relpath,argv[1],strlen(argv[1]));
 	char exepath[MAX_PATH] = {0};
 	memcpy(exepath,argv[0],strlen(argv[0]));
 	
-	if(relpath[0] == '.' || relpath[1] != ':'){
+	if(argv[1][0] == '.' || argv[1][1] != ':'){
+		memset(&relpath[0],0x00,MAX_PATH);
 		char* exenameBegin = strrchr(exepath,(int)'\\');
 		*exenameBegin = 0x00;
 		sprintf_s(relpath,MAX_PATH,"%s\\%s",exepath,argv[1]);
