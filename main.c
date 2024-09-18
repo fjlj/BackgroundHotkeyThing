@@ -126,6 +126,11 @@ int main(int argc, char *argv[]) {
 			toggle[0] = 0;
 		}
 		
+		//Super-Q  = quit
+		if(GetAsyncKeyState(VK_LWIN) < 0 && GetAsyncKeyState('Q') < 0){
+			running = 0;
+		}
+		
 		if(GetAsyncKeyState(VK_LWIN) < 0){
 			
 			//Super-Z   = toggle show/hide desktop icons
@@ -137,11 +142,7 @@ int main(int argc, char *argv[]) {
 			} else {
 				toggle[1] = 0;
 			}
-			//Super-Q  = quit
-			if(GetAsyncKeyState('Q') < 0){
-				running = 0;
-			}
-		
+	
 			if(GetAsyncKeyState(VK_LSHIFT) < 0 || GetAsyncKeyState(VK_RSHIFT) < 0) {
 				//Super+Shift-B = go back an image
 				if(!toggle[2] && GetAsyncKeyState('B') < 0 && prev != 0x00){
@@ -162,7 +163,7 @@ int main(int argc, char *argv[]) {
 				}
 			}
 		} else {
-			memset(toggle,0,sizeof(toggle));
+			memset(&toggle[0],0,sizeof(toggle));
 		}
 		loops++;
 		Sleep(75);
