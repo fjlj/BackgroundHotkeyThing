@@ -72,7 +72,8 @@ int main(int argc, char *argv[]) {
 		MAX_HISTORY = atoi(argv[2]) - 1;
 	}
 
-	char **prev = malloc(MAX_HISTORY+1*sizeof(char*));
+	char *prev_space = malloc(MAX_HISTORY+1*sizeof(char*));
+	char** prev = (char**)prev_space;
 
 	char relpath[MAX_PATH] = {0};
 	memcpy(relpath,argv[1],strlen(argv[1]));
