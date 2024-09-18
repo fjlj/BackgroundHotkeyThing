@@ -3,6 +3,7 @@
 #include <stdio.h>
 
 #define MAX_BGS 2000
+#define MAX_HISTORY 20
 
 int ListDirectoryContents(const char *sDir,char* storage, char* indexes[],int psize, const char* ext)
 {
@@ -58,22 +59,16 @@ int main(int argc, char *argv[]) {
 	char* bgs[MAX_BGS];
 	int toggle[10] = {0};
 	char orgPaper[MAX_PATH] = {0x00};
+	char* prev[11] = {0x00};
 	int prevInd = 0;
 	int loops = 0;
 	int loop_pause = 0;
-	int MAX_HISTORY = 20;
 	int running = 1;
+	
 	if(argc < 2){
 		MessageBoxA(0,"Usage: Icons_N_BGs.exe <path to BG images>\nNOTE: currently only PNG/JPG is searched for in a single path(non-recursive)\n","Woops",0);
 		return 0;
 	}
-	
-	if(argc > 2){
-		MAX_HISTORY = atoi(argv[2]) - 1;
-	}
-
-	char *prev_space = malloc(MAX_HISTORY+1*sizeof(char*));
-	char** prev = (char**)prev_space;
 
 	char relpath[MAX_PATH] = {0};
 	memcpy(relpath,argv[1],strlen(argv[1]));
@@ -116,8 +111,7 @@ int main(int argc, char *argv[]) {
 			if(loops >= 1440) loops = 0;
 			if(!toggle[0]){
 				loops = 0;
-				if(++prevInd  >= INT_MAX) prevInd = 0;
-				prev[prevInd%MAX_HISTORY] = bgs[rand()%numBgs];
+				prev[++prevInd%MAX_HISTORY] = bgs[rand()%numBgs];
 				//printf("pi:%d - Switching to: %s\n",prevInd%MAX_HISTORY,prev[prevInd%MAX_HISTORY]);
 				SystemParametersInfo(SPI_SETDESKWALLPAPER,0,prev[prevInd%MAX_HISTORY],SPIF_SENDCHANGE);
 				toggle[0] = 1;
@@ -146,6 +140,7 @@ int main(int argc, char *argv[]) {
 			if(GetAsyncKeyState(VK_LSHIFT) < 0 || GetAsyncKeyState(VK_RSHIFT) < 0) {
 				//Super+Shift-B = go back an image
 				if(!toggle[2] && GetAsyncKeyState('B') < 0 && prev != 0x00){
+					loops = 0;
 					if(--prevInd < 0) prevInd = 0;
 					toggle[2] = 1;
 					//printf("pi:%d - Switching to: %s\n",prevInd%MAX_HISTORY,prev[prevInd%MAX_HISTORY]);
