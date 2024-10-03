@@ -9,8 +9,11 @@ BackgroundHotkeyThing.exe <path to png files>
 ```
 
 # Hotkeys
-- Win-Z       - toggle show/hide desktop icons
 - Win+Shift-N - Set next Background
 - Win+Shift-B - Set previous Background
 - Win+Shift-V - Pause Auto Rotate
+
+- Win-Z       - Toggle show/hide desktop icons
+- Win-S       - Save current background into top of favorites (sets load position to top)
+- Win-F       - Load favorite at top/next slot (starts at top and goes backward)
 - Win-Q       - Quit
