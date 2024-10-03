@@ -267,6 +267,7 @@ int main(int argc, char *argv[]) {
 						if(--prevInd < 0) prevInd = 0;
 						if(prevInd == MAX_HISTORY) prevInd--;
 						int prevbg = prev[prevInd%MAX_HISTORY];
+						curbg = prevbg;
 						printFavs(favs,bgs);
 						SystemParametersInfo(SPI_SETDESKWALLPAPER,0,bgs[prevbg],SPIF_SENDCHANGE);
 					}
