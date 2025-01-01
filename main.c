@@ -2,10 +2,16 @@
 #include <windows.h>
 #include <stdio.h>
 
-#define MAX_BGS 2000
-#define MAX_HISTORY 20
+#define MAX_BGS 10000
+#define MAX_HISTORY 50
 #define MAX_iSTACK_SIZE 10
 #define SystemTimePointer ((_KSYSTEM_TIME*)0x7FFE0014)
+
+//#define DEBUG
+
+#ifndef DEBUG
+	#define printf(...) 
+#endif
 
 //struct to get system time from KUSER_SHARED_DATA pointer
 typedef struct {
@@ -22,26 +28,55 @@ typedef struct intStack {
 } intStack;
 
 //get all the paths in a folder that match a pattern
-int ListDirectoryContents(const char *sDir,char* storage, char* indexes[],int psize, const char* ext) {
+int ListDirectoryContents(const char *sDir,char* storage, char* indexes[],int psize, const char* ext, int *nsfwInd) {
 	WIN32_FIND_DATA fdFile;
 	HANDLE hFind = NULL;
 	char sPath[MAX_PATH] = {0};
+	char NSFWpath[MAX_PATH] = {0};
+
 	int ind = 1;
 	//Specify a file mask. *.* = We want everything!
-	sprintf_s(sPath,MAX_PATH, "%s\\%s", sDir,ext);
+	sprintf_s(sPath,MAX_PATH, "%s\\%s", sDir,"*.*");
+	sprintf_s(NSFWpath,MAX_PATH, "%s\\NSFW\\%s", sDir,"*.*");
 
 	if((hFind = FindFirstFile(sPath, &fdFile)) == INVALID_HANDLE_VALUE) {
 		return 0;
 	}
 
 	do {
-		if(strcmp(fdFile.cFileName, ".") != 0 && strcmp(fdFile.cFileName, "..") != 0) {
-			sprintf_s(sPath,MAX_PATH, "%s\\%s", sDir, fdFile.cFileName);
+		if(!(fdFile.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && 
+		   strcmp(fdFile.cFileName, ".") != 0  && 
+		   strcmp(fdFile.cFileName, "..") != 0 && 
+		   strstr(ext,strrchr(fdFile.cFileName,'.')) != NULL) {
+		   	
+			sprintf_s(sPath,MAX_PATH, "%s\\%s\x00", sDir, fdFile.cFileName);
 			size_t slen = strlen(sPath)+1;
 			memcpy(storage,sPath,slen);
 			indexes[ind++] = storage;
 			storage += slen;
-			//printf("File: %d:%s\n", ind-1,indexes[ind-1]);
+			printf("File: %d:%s\n", ind-1,indexes[ind-1]);
+		}
+	} while(FindNextFile(hFind, &fdFile) && ind < psize-1); //Find the next file.
+
+	FindClose(hFind); //Always, Always, clean things up!
+	*nsfwInd = ind;
+	
+	if((hFind = FindFirstFile(NSFWpath, &fdFile)) == INVALID_HANDLE_VALUE) {
+		return ind;
+	}
+
+	do {
+		if(!(fdFile.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+		   strcmp(fdFile.cFileName, ".") != 0 && 
+		   strcmp(fdFile.cFileName, "..") != 0 && 
+		   strstr(ext,strrchr(fdFile.cFileName,'.')) != NULL) {
+		   	
+			sprintf_s(NSFWpath,MAX_PATH, "%s\\NSFW\\%s\x00", sDir, fdFile.cFileName);
+			size_t slen = strlen(NSFWpath)+1;
+			memcpy(storage,NSFWpath,slen);
+			indexes[ind++] = storage;
+			storage += slen;
+			printf("File: %d:%s\n", ind-1,indexes[ind-1]);
 		}
 	} while(FindNextFile(hFind, &fdFile) && ind < psize-1); //Find the next file.
 
@@ -115,23 +150,36 @@ void printFavs(intStack* favs,char **bgs){
 
 int main(int argc, char *argv[]) {
 	_KSYSTEM_TIME st;
-	char* bgPaths = malloc(MAX_PATH*MAX_BGS);
+	char* bgPaths = malloc((MAX_PATH*MAX_BGS)+MAX_BGS+1);
 	char** bgs = malloc(MAX_BGS*sizeof(char*));
 	char orgPaper[MAX_PATH] = {0x00};
-	int toggle[10];
-	memset(toggle,0,sizeof(toggle));
-	int prev[10];
-	memset(prev,0,sizeof(prev));
-	intStack* favs = malloc(sizeof(intStack));
-	memset(favs->inds,0,sizeof(int)*MAX_iSTACK_SIZE);
-	favs->top = -1;
-	favs->pointer = 0;
+	int nsfwIndex = 4000;
 	int prevInd = 0;
 	int curbg = 0;
 	int loops = 0;
 	int loop_pause = 0;
 	int running = 1;
 	int approx_minutes = 2;
+	int prev[10] = {0x00};
+	int toggle[12] = {0x00};
+	
+	#define shDebounce toggle[0]
+	#define saveDeBounce toggle[1]
+	#define loadDebounce toggle[2]
+	#define nextDebounce toggle[3]
+	#define backDebounce toggle[4]
+	#define pausDebounce toggle[5]
+	#define nsfwDebounce toggle[6]
+	#define nsfw toggle[7]
+	
+	
+	memset(toggle,0,sizeof(toggle));
+	memset(prev,0,sizeof(prev));
+	intStack* favs = malloc(sizeof(intStack));
+	memset(favs->inds,0,sizeof(int)*MAX_iSTACK_SIZE);
+	favs->top = -1;
+	favs->pointer = 0;
+	
 
 	if(argc < 2) {
 		MessageBoxA(0,"Usage: BackgroundHotkeyThing.exe <path to BG images>\nNOTE: currently only PNG/JPG is searched for in a single path(non-recursive)\n","Woops",0);
@@ -171,8 +219,14 @@ int main(int argc, char *argv[]) {
 	bgPaths += ogPathLen;
 
 	//populate the paths and index arrays while getting the number of pngs
-	int numBgs = ListDirectoryContents(relpath,bgPaths,&bgs[1],MAX_BGS,"*.png");
-	numBgs += ListDirectoryContents(relpath,(bgs[numBgs-1]+strlen(bgs[numBgs-1])+1),&bgs[numBgs-1],MAX_BGS-numBgs,"*.jpg") - 1;
+	int numBgs = ListDirectoryContents(relpath,bgPaths,&bgs[1],MAX_BGS,"*.png;*.jpg",&nsfwIndex);
+	//numBgs += ListDirectoryContents(relpath,(bgs[numBgs-1]+strlen(bgs[numBgs-1])+1),&bgs[numBgs-1],MAX_BGS-numBgs,"*.jpg") - 1;
+	
+	printf("%d Backgrounds Loaded.\nNSFW Begins at:%d\n",numBgs,nsfwIndex);
+	if(nsfwIndex < 2){
+		printf("!!!!! Only NSFW images Loaded, NSFW enabled !!!!!\n");
+		nsfw = 1;
+	}
 
 	if(numBgs == 0 ) {
 		char errmsg[MAX_PATH+32];
@@ -187,18 +241,25 @@ int main(int argc, char *argv[]) {
 	//60 seconds in a min, 1000ms in a second = 60000ms/min
 	//sleep is 75ms (estimate instructions at 10ms) = 85ms
 	//60000 / 85 = 705
-	int approxMinToms = approx_minutes * 705;
+	//round to 700 because OCD
+	int approxMinToms = approx_minutes * 700;
 	int nextBg = 0;
 
 	while(running) {
-		nextBg = (rand()%(numBgs-1))+1;
+		if(!nsfw) {
+			nextBg = (rand()%(nsfwIndex-1))+2;
+		} else {
+			nextBg = nsfw == 2 ? (rand()%(numBgs-(nsfwIndex+1)))+nsfwIndex : (rand()%(numBgs-1))+1;
+		}
 
 		// every ~2 minutes update the BG or on Super-Shift+N for next or B for previous
 		if(loops >= approxMinToms && !loop_pause) {
 			loops = 0;
 			if(++prevInd%MAX_HISTORY == 0) prevInd++;
-			prev[prevInd%MAX_HISTORY] = nextBg;
-			SystemParametersInfo(SPI_SETDESKWALLPAPER,0,bgs[nextBg],SPIF_SENDCHANGE);
+			curbg = nextBg;
+			prev[prevInd%MAX_HISTORY] = curbg;
+			printf("Setting:[%d]%s\n",curbg,bgs[curbg]);
+			SystemParametersInfo(SPI_SETDESKWALLPAPER,0,bgs[curbg],SPIF_SENDCHANGE);
 		}
 
 		if(GetAsyncKeyState(VK_LWIN) < 0) {
@@ -209,81 +270,95 @@ int main(int argc, char *argv[]) {
 
 			//Super-Z   = toggle show/hide desktop icons
 			if(GetAsyncKeyState('Z') < 0) {
-				if(!toggle[0]) {
+				if(!shDebounce) {
 					SendMessage(hShellViewWin,0x0111, 0x7402, 0);
-					toggle[0] = 1;
+					shDebounce = 1;
 				}
 			} else {
-				toggle[0] = 0;
+				shDebounce = 0;
 			}
 			
 			//Super-S   = Save current BG to favs. (rotating 10 slots first in first out).
 			if(GetAsyncKeyState('S') < 0) {
-				if(!toggle[1]) {
+				if(!saveDeBounce) {
 					pushIntStack(favs,curbg);
 					//printf("set bg[%d] = %d - bg: %s\n",favs->top,favs->inds[favs->top],bgs[favs->inds[favs->top]]);
-					toggle[1] = 1;
+					saveDeBounce = 1;
 				}
 			} else {
-				toggle[1] = 0;
+				saveDeBounce = 0;
 			}
 			
 			//Super-F    = Load saved favs (roatating pointer from last in, does not pop favs from list)
 			if(GetAsyncKeyState('F') < 0) {
-				if(!toggle[2]) {
+				if(!loadDebounce) {
 					int favsp = favs->pointer;
 					int favSlot = peekIntStackItr(favs);
 					//printf("load bg[%d] = %d - bg: %s\n",favsp,favSlot,bgs[favSlot]);
+					printf("Setting:[%d]%s\n",favSlot,bgs[favSlot]);
 					SystemParametersInfo(SPI_SETDESKWALLPAPER,0,bgs[favSlot],SPIF_SENDCHANGE);
-					toggle[2] = 1;
+					loadDebounce = 1;
 				}
 			} else {
-				toggle[2] = 0;
+				loadDebounce = 0;
 			}
 
 			if(GetAsyncKeyState(VK_LSHIFT) < 0 || GetAsyncKeyState(VK_RSHIFT) < 0) {
 
 				//Super+Shift-N = go to next random image
 				if(GetAsyncKeyState('N') < 0) {
-					if(!toggle[3]) {
-						toggle[3] = 1;
+					if(!nextDebounce) {
+						nextDebounce = 1;
 						loops = 0;
 						if(++prevInd%MAX_HISTORY == 0) prevInd++;
 						if(prevInd >= MAX_HISTORY) prevInd = 1;
-						prev[prevInd%MAX_HISTORY] = nextBg;
 						curbg = nextBg;
-						printFavs(favs,bgs);
+						prev[prevInd%MAX_HISTORY] = curbg;
+						//printFavs(favs,bgs);
+						printf("Setting:[%d]%s\n",curbg,bgs[curbg]);
 						SystemParametersInfo(SPI_SETDESKWALLPAPER,0,bgs[curbg],SPIF_SENDCHANGE);
 					}
 				} else {
-					toggle[3] = 0;
+					nextDebounce = 0;
 				}
 
 				//Super+Shift-B = go back an image
 				if(GetAsyncKeyState('B') < 0 && prev != 0x00) {
-					if(!toggle[4]) {
-						toggle[4] = 1;
+					if(!backDebounce) {
+						backDebounce = 1;
 						loops = 0;
 						if(--prevInd < 0) prevInd = 0;
 						if(prevInd == MAX_HISTORY) prevInd--;
 						int prevbg = prev[prevInd%MAX_HISTORY];
 						curbg = prevbg;
-						printFavs(favs,bgs);
-						SystemParametersInfo(SPI_SETDESKWALLPAPER,0,bgs[prevbg],SPIF_SENDCHANGE);
+						//printFavs(favs,bgs);
+						printf("Setting:[%d]%s\n",curbg,bgs[curbg]);
+						SystemParametersInfo(SPI_SETDESKWALLPAPER,0,bgs[curbg],SPIF_SENDCHANGE);
 					}
 				} else {
-					toggle[4] = 0;
+					backDebounce = 0;
 				}
 
 				//Super+Shift-V = pause timed cycling
 				if(GetAsyncKeyState('V') < 0) {
-					if(!toggle[5]) {
-						toggle[5] = 1;
+					if(!pausDebounce) {
+						pausDebounce = 1;
 						loop_pause ^= 1;
 						if(!loop_pause) loops = 1400;
 					}
 				} else {
-					toggle[5] = 0;
+					pausDebounce = 0;
+				}
+				
+				//Super+Shift-H = toggle NSFW
+				if(GetAsyncKeyState('H') < 0) {
+					if(!nsfwDebounce) {
+						nsfwDebounce = 1;
+						nsfw = ++nsfw % 3;
+						printf("NSFW:%d\n",nsfw);
+					}
+				} else {
+					nsfwDebounce = 0;
 				}
 			}
 		}
