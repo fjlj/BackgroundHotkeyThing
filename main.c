@@ -13,6 +13,19 @@
 	#define printf(...) 
 #endif
 
+enum Keys {
+	WIN = 1,
+	SHIFT = 2,
+	S = 4,
+	F = 8,
+	Q = 16,
+	B = 32,
+	V = 64,
+	N = 128,
+	H = 256,
+	L = 512
+};
+
 //struct to get system time from KUSER_SHARED_DATA pointer
 typedef struct {
 	ULONG LowPart;
@@ -148,18 +161,23 @@ void printFavs(intStack* favs,char **bgs){
 	}
 }
 
+int checkHotkey(int key_s){
+
+}
+
 int main(int argc, char *argv[]) {
 	_KSYSTEM_TIME st;
 	char* bgPaths = malloc((MAX_PATH*MAX_BGS)+MAX_BGS+1);
 	char** bgs = malloc(MAX_BGS*sizeof(char*));
 	char orgPaper[MAX_PATH] = {0x00};
 	int nsfwIndex = 4000;
+	int running = 1;
+	int approx_minutes = 2;
 	int prevInd = 0;
 	int curbg = 0;
 	int loops = 0;
 	int loop_pause = 0;
-	int running = 1;
-	int approx_minutes = 2;
+	int nsfw = 0;
 	int prev[10] = {0x00};
 	int toggle[12] = {0x00};
 	
@@ -170,11 +188,7 @@ int main(int argc, char *argv[]) {
 	#define backDebounce toggle[4]
 	#define pausDebounce toggle[5]
 	#define nsfwDebounce toggle[6]
-	#define nsfw toggle[7]
 	
-	
-	memset(toggle,0,sizeof(toggle));
-	memset(prev,0,sizeof(prev));
 	intStack* favs = malloc(sizeof(intStack));
 	memset(favs->inds,0,sizeof(int)*MAX_iSTACK_SIZE);
 	favs->top = -1;
@@ -269,36 +283,30 @@ int main(int argc, char *argv[]) {
 			}
 
 			//Super-Z   = toggle show/hide desktop icons
-			if(GetAsyncKeyState('Z') < 0) {
-				if(!shDebounce) {
-					SendMessage(hShellViewWin,0x0111, 0x7402, 0);
+			if(GetAsyncKeyState('Z') < 0 && !shDebounce) {
 					shDebounce = 1;
-				}
+					SendMessage(hShellViewWin,0x0111, 0x7402, 0);
 			} else {
 				shDebounce = 0;
 			}
 			
 			//Super-S   = Save current BG to favs. (rotating 10 slots first in first out).
-			if(GetAsyncKeyState('S') < 0) {
-				if(!saveDeBounce) {
+			if(GetAsyncKeyState('S') < 0 && !saveDeBounce) {
 					pushIntStack(favs,curbg);
 					//printf("set bg[%d] = %d - bg: %s\n",favs->top,favs->inds[favs->top],bgs[favs->inds[favs->top]]);
 					saveDeBounce = 1;
-				}
 			} else {
 				saveDeBounce = 0;
 			}
 			
 			//Super-F    = Load saved favs (roatating pointer from last in, does not pop favs from list)
-			if(GetAsyncKeyState('F') < 0) {
-				if(!loadDebounce) {
+			if(GetAsyncKeyState('F') < 0 && !loadDebounce) {
 					int favsp = favs->pointer;
 					int favSlot = peekIntStackItr(favs);
 					//printf("load bg[%d] = %d - bg: %s\n",favsp,favSlot,bgs[favSlot]);
 					printf("Setting:[%d]%s\n",favSlot,bgs[favSlot]);
 					SystemParametersInfo(SPI_SETDESKWALLPAPER,0,bgs[favSlot],SPIF_SENDCHANGE);
 					loadDebounce = 1;
-				}
 			} else {
 				loadDebounce = 0;
 			}
@@ -306,8 +314,7 @@ int main(int argc, char *argv[]) {
 			if(GetAsyncKeyState(VK_LSHIFT) < 0 || GetAsyncKeyState(VK_RSHIFT) < 0) {
 
 				//Super+Shift-N = go to next random image
-				if(GetAsyncKeyState('N') < 0) {
-					if(!nextDebounce) {
+				if(GetAsyncKeyState('N') < 0 && !nextDebounce) {
 						nextDebounce = 1;
 						loops = 0;
 						if(++prevInd%MAX_HISTORY == 0) prevInd++;
@@ -317,14 +324,12 @@ int main(int argc, char *argv[]) {
 						//printFavs(favs,bgs);
 						printf("Setting:[%d]%s\n",curbg,bgs[curbg]);
 						SystemParametersInfo(SPI_SETDESKWALLPAPER,0,bgs[curbg],SPIF_SENDCHANGE);
-					}
 				} else {
 					nextDebounce = 0;
 				}
 
 				//Super+Shift-B = go back an image
-				if(GetAsyncKeyState('B') < 0 && prev != 0x00) {
-					if(!backDebounce) {
+				if(GetAsyncKeyState('B') < 0 && prev != 0x00 && !backDebounce) {
 						backDebounce = 1;
 						loops = 0;
 						if(--prevInd < 0) prevInd = 0;
@@ -334,33 +339,28 @@ int main(int argc, char *argv[]) {
 						//printFavs(favs,bgs);
 						printf("Setting:[%d]%s\n",curbg,bgs[curbg]);
 						SystemParametersInfo(SPI_SETDESKWALLPAPER,0,bgs[curbg],SPIF_SENDCHANGE);
-					}
-				} else {
+				}  else {
 					backDebounce = 0;
 				}
 
 				//Super+Shift-V = pause timed cycling
-				if(GetAsyncKeyState('V') < 0) {
-					if(!pausDebounce) {
+				if(GetAsyncKeyState('V') < 0 && !pausDebounce) {
 						pausDebounce = 1;
 						loop_pause ^= 1;
 						if(!loop_pause) loops = 1400;
-					}
 				} else {
 					pausDebounce = 0;
 				}
 				
 				//Super+Shift-H = toggle NSFW
-				if(GetAsyncKeyState('H') < 0) {
-					if(!nsfwDebounce) {
+				if(GetAsyncKeyState('H') < 0 && !nsfwDebounce) {
 						nsfwDebounce = 1;
 						nsfw = ++nsfw % 3;
 						printf("NSFW:%d\n",nsfw);
-					}
 				} else {
 					nsfwDebounce = 0;
 				}
-			}
+			} 
 		}
 		loops++;
 		Sleep(75);
