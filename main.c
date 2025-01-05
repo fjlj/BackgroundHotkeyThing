@@ -261,9 +261,8 @@ int initBGs(char* relpath, char** bgs, char* bgPaths, char* orgPaper, int* nsfwI
 	bgPaths += ogPathLen;
 
 	//populate the paths and index arrays while getting the number of pngs
-	int numBgs = ListDirectoryContents(relpath,bgPaths,&bgs[1],MAX_BGS,"*.png;*.jpg",nsfwIndex);
-	//numBgs += ListDirectoryContents(relpath,(bgs[numBgs-1]+strlen(bgs[numBgs-1])+1),&bgs[numBgs-1],MAX_BGS-numBgs,"*.jpg") - 1;
-	
+	int numBgs = ListDirectoryContents(relpath,bgPaths,&bgs[1],MAX_BGS,"*.png;*.jpg;*.bmp",nsfwIndex);
+
 	printf("%d Backgrounds Loaded.\nNSFW Begins at:%d\n",numBgs,*nsfwIndex);
 
 	if(numBgs == 0 ) {
@@ -297,7 +296,7 @@ int main(int argc, char *argv[]) {
 	favs->pointer = 0;
 
 	if(argc < 2) {
-		MessageBoxA(0,"Usage: BackgroundHotkeyThing.exe <path to BG images>\nNOTE: currently only PNG/JPG is searched for in a single path(non-recursive)\n","Woops",0);
+		MessageBoxA(0,"Usage: BackgroundHotkeyThing.exe <path to BG images> <rotation delay in seconds>\nNOTE: single folder(non-recursive)\n","Woops",0);
 		return 0;
 	}
 	

@@ -1,5 +1,5 @@
 # BackgroundHotkeyThing
-A small program to scan a folder for png/jpg files and cycle through them as desktop backgrounds.
+A small program to scan a folder for png/jpg/bmp files and cycle through them as desktop backgrounds.
 
 Also looks for a folder named NSFW within given folder for photos for use only in an NSFW mode.
 
@@ -19,7 +19,7 @@ Customize rotation speed (its an approximation of seconds, good enough and adds 
 
 # Usage
 ```
-BackgroundHotkeyThing.exe <path to png files> <number of seconds to delay rotation>
+BackgroundHotkeyThing.exe <absolute or relative path to png/jpg/bmp files> <number of seconds to delay rotation>
 ```
 
 # Hotkeys
