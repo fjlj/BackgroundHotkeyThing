@@ -11,7 +11,7 @@ Allow skipping to random next BG.
 
 Allow pausing/favoriting/saving favorites.
 
-Two cycle modes: Normal(All photos filtered by NSFW mode)/Only Favorites.
+Two cycle modes: Normal(All photos filtered by NSFW mode)/Only Favorites(also filtered by NSFW mode).
 
 Three NSFW modes: Off, Combined, Only NSFW folder.
 
