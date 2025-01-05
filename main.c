@@ -13,18 +13,21 @@
 	#define printf(...) 
 #endif
 
-enum Keys {
-	WIN = 1,
-	SHIFT = 2,
-	S = 4,
-	F = 8,
-	Q = 16,
-	B = 32,
-	V = 64,
-	N = 128,
-	H = 256,
-	L = 512
-};
+typedef enum {
+	keys_WIN = 1,
+	keys_SHIFT = 2,
+	keys_S = 4,
+	keys_F = 8,
+	keys_Q = 16,
+	keys_B = 32,
+	keys_V = 64,
+	keys_N = 128,
+	keys_H = 256,
+	keys_L = 512,
+	keys_Z = 1024,
+	keys_E = 2048,
+	keys_C = 4096
+} Keys;
 
 //struct to get system time from KUSER_SHARED_DATA pointer
 typedef struct {
@@ -41,7 +44,7 @@ typedef struct intStack {
 } intStack;
 
 //get all the paths in a folder that match a pattern
-int ListDirectoryContents(const char *sDir,char* storage, char* indexes[],int psize, const char* ext, int *nsfwInd) {
+int ListDirectoryContents(const char *sDir,char* storage, char* indexes[], int psize, const char* ext, int *nsfwInd) {
 	WIN32_FIND_DATA fdFile;
 	HANDLE hFind = NULL;
 	char sPath[MAX_PATH] = {0};
@@ -156,13 +159,121 @@ int peekIntStackItr(intStack* stack){
 
 //used for debugging (prints all current favorites)
 void printFavs(intStack* favs,char **bgs){
+	printf("------Current Favorites------\n");
 	for(int i = 0; i <= favs->top; i++){
 		printf("fav[%d]:%d = %s\n",i,favs->inds[i],bgs[favs->inds[i]]);
 	}
 }
 
-int checkHotkey(int key_s){
+void exportFavs(char* efavfpath,intStack* favs, char **bgs){
+	char slotName[16] = {0};
+	for(int i = 0; i <= favs->top; i++){
+		sprintf_s(slotName,16,"Fav-%d",i);
+		WritePrivateProfileStringA(
+			"Favs",
+			slotName,
+			bgs[favs->inds[i]],
+			efavfpath);
+	}  
+}
 
+void importFavs(char* efavfpath, intStack* favs,char* bgs[],int numBgs){
+	char favPath[MAX_PATH] = {0x00};
+	char slotName[16] = {0};
+	for(int i = 0; i <= MAX_iSTACK_SIZE; i++){
+		
+		sprintf_s(slotName,16,"Fav-%d",i);
+		
+		if(
+			!GetPrivateProfileStringA(
+	  		"Favs",
+		    slotName,
+		    "",
+		    favPath,
+		    MAX_PATH,
+		    efavfpath)
+		) break;
+	    
+	    for(int o = 0; o < numBgs; o++){
+			if(strcmp(bgs[o], favPath) == 0){
+				pushIntStack(favs,o);
+			}
+		} 	
+	}	    
+}
+
+int checkHotkey(int key_s, int* debounce){
+	if(*debounce) return 0;
+	int pressed = 1;
+	
+	if(key_s & keys_SHIFT)
+		pressed &= (GetAsyncKeyState(VK_LSHIFT) < 0 || GetAsyncKeyState(VK_RSHIFT) < 0) ? 1 : 0; 
+	if(key_s & keys_WIN)
+		pressed &= (GetAsyncKeyState(VK_LWIN) < 0  || GetAsyncKeyState(VK_RWIN) < 0) ? 1 : 0;
+	if(key_s & keys_F)
+		pressed &= GetAsyncKeyState('F') < 0 ? 1 : 0;
+	if(key_s & keys_V)
+		pressed &= GetAsyncKeyState('V') < 0 ? 1 : 0;
+	if(key_s & keys_B)
+		pressed &= GetAsyncKeyState('B') < 0 ? 1 : 0;
+	if(key_s & keys_N)
+		pressed &= GetAsyncKeyState('N') < 0 ? 1 : 0; 
+	if(key_s & keys_H)
+		pressed &= GetAsyncKeyState('H') < 0 ? 1 : 0;
+	if(key_s & keys_S)
+		pressed &= GetAsyncKeyState('S') < 0 ? 1 : 0;
+	if(key_s & keys_L)
+		pressed &= GetAsyncKeyState('L') < 0 ? 1 : 0;
+	if(key_s & keys_Q)
+		pressed &= GetAsyncKeyState('Q') < 0 ? 1 : 0;
+	if(key_s & keys_Z)
+		pressed &= GetAsyncKeyState('Z') < 0 ? 1 : 0;
+	if(key_s & keys_E)
+		pressed &= GetAsyncKeyState('E') < 0 ? 1 : 0;
+	if(key_s & keys_C)
+		pressed &= GetAsyncKeyState('C') < 0 ? 1 : 0;
+	
+	*debounce = pressed*4;
+	
+	return pressed;
+}
+
+int nextFav(char** bgs, intStack* favs, int nsfw) {
+	int favsp = favs->pointer;
+	int favSlot = peekIntStackItr(favs);
+	if(!strstr(bgs[favSlot],"NSFW") || nsfw > 0){
+		printf("load fav[%d] = %d - bg: %s\n",favsp,favSlot,bgs[favSlot]);
+		SystemParametersInfo(SPI_SETDESKWALLPAPER,0,bgs[favSlot],SPIF_SENDCHANGE);
+		return favSlot;
+	}
+	printf("Not Loading NSFW favorite while NSFW mode disabled\n");
+	return -1;
+}
+
+int initBGs(char* relpath, char** bgs, char* bgPaths, char* orgPaper, int* nsfwIndex){
+
+	//get the current BG and set it as the first in history
+	SystemParametersInfo(SPI_GETDESKWALLPAPER,MAX_PATH,orgPaper,0);
+	size_t ogPathLen = strlen(orgPaper)+1;
+	memcpy(bgPaths,orgPaper,ogPathLen);
+	
+	bgs[0] = bgPaths;
+	bgPaths += ogPathLen;
+
+	//populate the paths and index arrays while getting the number of pngs
+	int numBgs = ListDirectoryContents(relpath,bgPaths,&bgs[1],MAX_BGS,"*.png;*.jpg",nsfwIndex);
+	//numBgs += ListDirectoryContents(relpath,(bgs[numBgs-1]+strlen(bgs[numBgs-1])+1),&bgs[numBgs-1],MAX_BGS-numBgs,"*.jpg") - 1;
+	
+	printf("%d Backgrounds Loaded.\nNSFW Begins at:%d\n",numBgs,*nsfwIndex);
+
+	if(numBgs == 0 ) {
+		char errmsg[MAX_PATH+32];
+		sprintf_s(errmsg,MAX_PATH+32,"Path or Images not found at: [%s]\n",relpath);
+		MessageBoxA(0,errmsg,"Whoops!", 0);
+		return 0;
+	}
+	
+	return numBgs;
 }
 
 int main(int argc, char *argv[]) {
@@ -178,35 +289,23 @@ int main(int argc, char *argv[]) {
 	int loops = 0;
 	int loop_pause = 0;
 	int nsfw = 0;
-	int prev[10] = {0x00};
-	int toggle[12] = {0x00};
-	
-	#define shDebounce toggle[0]
-	#define saveDeBounce toggle[1]
-	#define loadDebounce toggle[2]
-	#define nextDebounce toggle[3]
-	#define backDebounce toggle[4]
-	#define pausDebounce toggle[5]
-	#define nsfwDebounce toggle[6]
-	
+	int prev[MAX_HISTORY] = {0x00};
+	prev[0] = 0;
 	intStack* favs = malloc(sizeof(intStack));
 	memset(favs->inds,0,sizeof(int)*MAX_iSTACK_SIZE);
 	favs->top = -1;
 	favs->pointer = 0;
-	
 
 	if(argc < 2) {
 		MessageBoxA(0,"Usage: BackgroundHotkeyThing.exe <path to BG images>\nNOTE: currently only PNG/JPG is searched for in a single path(non-recursive)\n","Woops",0);
 		return 0;
 	}
+	
 	if(argc > 2) {
 		int tmp = atoi(argv[2]);
 		approx_minutes = (tmp > 0  ? tmp : approx_minutes);
-		//char tmps[32] = {0};
-		//sprintf_s(tmps,32,"Approx Wait set to %d minutes.",tmp);
-		//MessageBoxA(0,tmps,"debug",0);
 	}
-
+	
 	char relpath[MAX_PATH] = {0};
 	memcpy(relpath,argv[1],strlen(argv[1]));
 	char exepath[MAX_PATH] = {0};
@@ -219,36 +318,23 @@ int main(int argc, char *argv[]) {
 		*exenameBegin = 0x00;
 		sprintf_s(relpath,MAX_PATH,"%s\\%s",exepath,argv[1]);
 	}
-
+	
+	//set savepath
+	char efavfpath[MAX_PATH] = {0};
+	sprintf_s(efavfpath,MAX_PATH,"%s\\BackgroundHotkeyThing.ini",relpath);
+	
 	//do some very basic random seeding via some ASLR and system time values from KUSER_SHARED_DATA...
 	memcpy(&st,SystemTimePointer,sizeof(st));
 	srand((unsigned int)((uintptr_t)&main + (uintptr_t)&ListDirectoryContents) + st.LowPart);
-
-	//get the current BG and set it as the first in history
-	SystemParametersInfo(SPI_GETDESKWALLPAPER,MAX_PATH,&orgPaper,0);
-	size_t ogPathLen = strlen(orgPaper)+1;
-	memcpy(bgPaths,orgPaper,ogPathLen);
-	prev[0] = 0;
-	bgs[0] = bgPaths;
-	bgPaths += ogPathLen;
-
-	//populate the paths and index arrays while getting the number of pngs
-	int numBgs = ListDirectoryContents(relpath,bgPaths,&bgs[1],MAX_BGS,"*.png;*.jpg",&nsfwIndex);
-	//numBgs += ListDirectoryContents(relpath,(bgs[numBgs-1]+strlen(bgs[numBgs-1])+1),&bgs[numBgs-1],MAX_BGS-numBgs,"*.jpg") - 1;
 	
-	printf("%d Backgrounds Loaded.\nNSFW Begins at:%d\n",numBgs,nsfwIndex);
+	int numBgs = initBGs(relpath,bgs,bgPaths,orgPaper,&nsfwIndex);
+	
+	importFavs(efavfpath,favs,bgs,numBgs);
+	
 	if(nsfwIndex < 2){
 		printf("!!!!! Only NSFW images Loaded, NSFW enabled !!!!!\n");
 		nsfw = 1;
 	}
-
-	if(numBgs == 0 ) {
-		char errmsg[MAX_PATH+32];
-		sprintf_s(errmsg,MAX_PATH+32,"Path or Images not found at: [%s]\n",relpath);
-		MessageBoxA(0,errmsg,"Whoops!", 0);
-		return 0;
-	}
-
 	//get a handle to the desktop to recieve show/hide icon messages
 	HWND hShellViewWin = gethShellViewWin();
 
@@ -258,8 +344,12 @@ int main(int argc, char *argv[]) {
 	//round to 700 because OCD
 	int approxMinToms = approx_minutes * 700;
 	int nextBg = 0;
-
+	int something_pressed = 0;
+	int onlyFavs = 0;
 	while(running) {
+		if(something_pressed > 0) 
+			something_pressed--;
+			
 		if(!nsfw) {
 			nextBg = (rand()%(nsfwIndex-1))+2;
 		} else {
@@ -269,98 +359,102 @@ int main(int argc, char *argv[]) {
 		// every ~2 minutes update the BG or on Super-Shift+N for next or B for previous
 		if(loops >= approxMinToms && !loop_pause) {
 			loops = 0;
-			if(++prevInd%MAX_HISTORY == 0) prevInd++;
-			curbg = nextBg;
-			prev[prevInd%MAX_HISTORY] = curbg;
-			printf("Setting:[%d]%s\n",curbg,bgs[curbg]);
-			SystemParametersInfo(SPI_SETDESKWALLPAPER,0,bgs[curbg],SPIF_SENDCHANGE);
+			if(onlyFavs){
+				int nextFfavs = nextFav(bgs,favs,nsfw);
+				curbg = (nextFfavs == -1 ? curbg : nextFfavs);
+			} else {
+				if(++prevInd%MAX_HISTORY == 0) prevInd++;
+				curbg = nextBg;
+				prev[prevInd%MAX_HISTORY] = curbg;
+				printf("Setting:[%d]%s\n",curbg,bgs[curbg]);
+				SystemParametersInfo(SPI_SETDESKWALLPAPER,0,bgs[curbg],SPIF_SENDCHANGE);
+			}
 		}
 
-		if(GetAsyncKeyState(VK_LWIN) < 0) {
-			//Super-Q  = quit
-			if(GetAsyncKeyState('Q') < 0) {
-				running = 0;
-			}
+		//Super-Q  = quit
+		if(checkHotkey(keys_WIN | keys_Q, &something_pressed)) {
+			running = 0;
+		}
 
-			//Super-Z   = toggle show/hide desktop icons
-			if(GetAsyncKeyState('Z') < 0 && !shDebounce) {
-					shDebounce = 1;
-					SendMessage(hShellViewWin,0x0111, 0x7402, 0);
-			} else {
-				shDebounce = 0;
-			}
-			
-			//Super-S   = Save current BG to favs. (rotating 10 slots first in first out).
-			if(GetAsyncKeyState('S') < 0 && !saveDeBounce) {
-					pushIntStack(favs,curbg);
-					//printf("set bg[%d] = %d - bg: %s\n",favs->top,favs->inds[favs->top],bgs[favs->inds[favs->top]]);
-					saveDeBounce = 1;
-			} else {
-				saveDeBounce = 0;
-			}
-			
-			//Super-F    = Load saved favs (roatating pointer from last in, does not pop favs from list)
-			if(GetAsyncKeyState('F') < 0 && !loadDebounce) {
-					int favsp = favs->pointer;
-					int favSlot = peekIntStackItr(favs);
-					//printf("load bg[%d] = %d - bg: %s\n",favsp,favSlot,bgs[favSlot]);
-					printf("Setting:[%d]%s\n",favSlot,bgs[favSlot]);
-					SystemParametersInfo(SPI_SETDESKWALLPAPER,0,bgs[favSlot],SPIF_SENDCHANGE);
-					loadDebounce = 1;
-			} else {
-				loadDebounce = 0;
-			}
+		//Super-Z   = toggle show/hide desktop icons
+		if(checkHotkey(keys_WIN | keys_Z, &something_pressed)) {
+				SendMessage(hShellViewWin,0x0111, 0x7402, 0);
+		}
+		
+		//Super-S   = Save current BG to favs. (rotating 10 slots first in first out).
+		if(checkHotkey(keys_WIN | keys_S, &something_pressed)) {
+				pushIntStack(favs,curbg);
+				printFavs(favs,bgs);
+				//printf("set bg[%d] = %d - bg: %s\n",favs->top,favs->inds[favs->top],bgs[favs->inds[favs->top]]);
+		}
+		
+		//Super-F    = Load saved favs (roatating pointer from last in, does not pop favs from list)
+		if(checkHotkey(keys_WIN | keys_F, &something_pressed)) {
+			int nextFfavs = nextFav(bgs,favs,nsfw);
+			curbg = (nextFfavs == -1 ? curbg : nextFfavs);
+		}
 
-			if(GetAsyncKeyState(VK_LSHIFT) < 0 || GetAsyncKeyState(VK_RSHIFT) < 0) {
 
-				//Super+Shift-N = go to next random image
-				if(GetAsyncKeyState('N') < 0 && !nextDebounce) {
-						nextDebounce = 1;
-						loops = 0;
-						if(++prevInd%MAX_HISTORY == 0) prevInd++;
-						if(prevInd >= MAX_HISTORY) prevInd = 1;
-						curbg = nextBg;
-						prev[prevInd%MAX_HISTORY] = curbg;
-						//printFavs(favs,bgs);
-						printf("Setting:[%d]%s\n",curbg,bgs[curbg]);
-						SystemParametersInfo(SPI_SETDESKWALLPAPER,0,bgs[curbg],SPIF_SENDCHANGE);
+		//Super+Shift-N = go to next random image
+		if(checkHotkey(keys_WIN | keys_SHIFT | keys_N, &something_pressed)) {
+				loops = 0;
+				if(onlyFavs){
+					int nextFfavs = nextFav(bgs,favs,nsfw);
+					curbg = (nextFfavs == -1 ? curbg : nextFfavs);
 				} else {
-					nextDebounce = 0;
+					if(++prevInd%MAX_HISTORY == 0) prevInd++;
+					if(prevInd >= MAX_HISTORY) prevInd = 1;
+					curbg = nextBg;
+					prev[prevInd%MAX_HISTORY] = curbg;
+					printf("Setting:[%d]%s\n",curbg,bgs[curbg]);
+					SystemParametersInfo(SPI_SETDESKWALLPAPER,0,bgs[curbg],SPIF_SENDCHANGE);
 				}
+		} 
 
-				//Super+Shift-B = go back an image
-				if(GetAsyncKeyState('B') < 0 && prev != 0x00 && !backDebounce) {
-						backDebounce = 1;
-						loops = 0;
-						if(--prevInd < 0) prevInd = 0;
-						if(prevInd == MAX_HISTORY) prevInd--;
-						int prevbg = prev[prevInd%MAX_HISTORY];
-						curbg = prevbg;
-						//printFavs(favs,bgs);
-						printf("Setting:[%d]%s\n",curbg,bgs[curbg]);
-						SystemParametersInfo(SPI_SETDESKWALLPAPER,0,bgs[curbg],SPIF_SENDCHANGE);
-				}  else {
-					backDebounce = 0;
-				}
+		//Super+Shift-B = go back an image
+		if(checkHotkey(keys_WIN | keys_SHIFT | keys_B, &something_pressed) && prev != 0x00) {
+				loops = 0;
+				if(--prevInd < 0) prevInd = 0;
+				if(prevInd == MAX_HISTORY) prevInd--;
+				int prevbg = prev[prevInd%MAX_HISTORY];
+				curbg = prevbg;
+				//printFavs(favs,bgs);
+				printf("Setting:[%d]%s\n",curbg,bgs[curbg]);
+				SystemParametersInfo(SPI_SETDESKWALLPAPER,0,bgs[curbg],SPIF_SENDCHANGE);
+		}
 
-				//Super+Shift-V = pause timed cycling
-				if(GetAsyncKeyState('V') < 0 && !pausDebounce) {
-						pausDebounce = 1;
-						loop_pause ^= 1;
-						if(!loop_pause) loops = 1400;
-				} else {
-					pausDebounce = 0;
-				}
-				
-				//Super+Shift-H = toggle NSFW
-				if(GetAsyncKeyState('H') < 0 && !nsfwDebounce) {
-						nsfwDebounce = 1;
-						nsfw = ++nsfw % 3;
-						printf("NSFW:%d\n",nsfw);
-				} else {
-					nsfwDebounce = 0;
-				}
-			} 
+		//Super+Shift-V = pause timed cycling
+		if(checkHotkey(keys_WIN | keys_SHIFT | keys_V, &something_pressed)) {
+				loop_pause ^= 1;
+				if(!loop_pause) loops = 1400;
+		}
+		
+		//Super+Shift-H = toggle NSFW
+		if(checkHotkey(keys_WIN | keys_SHIFT | keys_H, &something_pressed)) {
+				nsfw = ++nsfw % 3;
+				printf("NSFW:%d\n",nsfw);
+		}
+		
+		//Super+Shift-L = only cycle favorites
+		if(checkHotkey(keys_WIN | keys_SHIFT | keys_L, &something_pressed)) {
+				onlyFavs ^= 1;
+				printf("Cycle:%s\n",(onlyFavs ? "Only Favorites" : "Normal"));
+		}
+		
+		//Super+Shift-E = Export Favorites
+		if(checkHotkey(keys_WIN | keys_SHIFT | keys_E, &something_pressed)) {
+				printf("Exporting %d Favorites\n",favs->top);
+				exportFavs(efavfpath,favs,bgs);
+		}
+		
+		//Super+Shift-C = Clear Favorites
+		if(checkHotkey(keys_WIN | keys_SHIFT | keys_C, &something_pressed)) {
+				printf("Clearing Favorites\n",favs->top);
+				WritePrivateProfileStringA(
+					"Favs",
+					0,
+					0,
+					efavfpath);
 		}
 		loops++;
 		Sleep(75);
