@@ -1,12 +1,20 @@
 # BackgroundHotkeyThing
 A small program to scan a folder for png/jpg files and cycle through them as desktop backgrounds.
+
 Also looks for a folder named NSFW within given folder for photos for use only in an NSFW mode.
+
 Allow showing/hiding desktop icons with hotkey.
+
 Allow goin back for up to 50 previous backgrounds (in order of display).
+
 Allow skipping to random next BG.
+
 Allow pausing/favoriting/saving favorites.
+
 Two cycle modes: Normal(All photos filtered by NSFW mode)/Only Favorites.
+
 Three NSFW modes: Off, Combined, Only NSFW folder.
+
 Customize rotation speed (its an approximation of seconds, good enough and adds a little randomness)...
 
 # Usage
