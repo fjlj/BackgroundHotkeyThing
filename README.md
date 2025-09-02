@@ -31,6 +31,9 @@ BackgroundHotkeyThing.exe <absolute or relative path to png/jpg/bmp files> <numb
 - Win+Shift-E - Export Favorited to file (located in provided wallpaper path as BackgroundHotkeyThing.ini)
 - Win+Shift-C - Clears Saved favorites from Exported File (may update to also clear current loaded favorites)
 
+- Win+Alt-S   - Save Current Settings (Paused/NSFW/Only Favorites)
+- Win+Alt-L   - Re-load saved Settings
+
 - Win-Z       - Toggle show/hide desktop icons
 - Win-S       - Save current background into top of favorites (sets load position to top)
 - Win-F       - Load favorite at top slot (starts at top and goes backward)
