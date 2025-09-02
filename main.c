@@ -16,18 +16,25 @@
 typedef enum {
 	keys_WIN = 1,
 	keys_SHIFT = 2,
-	keys_S = 4,
-	keys_F = 8,
-	keys_Q = 16,
-	keys_B = 32,
-	keys_V = 64,
-	keys_N = 128,
-	keys_H = 256,
-	keys_L = 512,
-	keys_Z = 1024,
-	keys_E = 2048,
-	keys_C = 4096
+	keys_ALT = 4,
+	keys_S = 8,
+	keys_F = 16,
+	keys_Q = 32,
+	keys_B = 64,
+	keys_V = 128,
+	keys_N = 256,
+	keys_H = 512,
+	keys_L = 1024,
+	keys_Z = 2048,
+	keys_E = 4096,
+	keys_C = 8192
 } Keys;
+
+typedef enum {
+	onlyFavs   = 0,
+	nsfw       = 1,
+	loop_pause = 2
+} Settings;
 
 //struct to get system time from KUSER_SHARED_DATA pointer
 typedef struct {
@@ -177,6 +184,37 @@ void exportFavs(char* efavfpath,intStack* favs, char **bgs){
 	}  
 }
 
+void saveSettings(char* efavfpath, int* settings[]){
+	char slotName[16] = {0};
+	for(int i = 0; i < 3; ++i){
+		char ival[8] = {0};
+		itoa((*settings)[i],ival,10);
+		sprintf_s(slotName,16,"Set-%d",i);
+		WritePrivateProfileStringA(
+			"Settings",
+			slotName,
+			ival,
+			efavfpath);
+	}  
+}
+
+void loadSettings(char* efavfpath, int* settings[]){
+	char slotName[16] = {0};
+	for(int i = 0; i < 3; ++i){
+		char ival[8] = {0};
+		sprintf_s(slotName,16,"Set-%d",i);
+		if(!GetPrivateProfileStringA(
+	  		"Settings",
+		    slotName,
+		    "",
+		    ival,
+		    7,
+		    efavfpath)
+		) break;
+	    (*settings)[i] = (int)atoi(ival);		
+	}  
+}
+
 void importFavs(char* efavfpath, intStack* favs,char* bgs[],int numBgs){
 	char favPath[MAX_PATH] = {0x00};
 	char slotName[16] = {0};
@@ -184,8 +222,7 @@ void importFavs(char* efavfpath, intStack* favs,char* bgs[],int numBgs){
 		
 		sprintf_s(slotName,16,"Fav-%d",i);
 		
-		if(
-			!GetPrivateProfileStringA(
+		if(!GetPrivateProfileStringA(
 	  		"Favs",
 		    slotName,
 		    "",
@@ -204,35 +241,53 @@ void importFavs(char* efavfpath, intStack* favs,char* bgs[],int numBgs){
 
 int checkHotkey(int key_s, int* debounce){
 	if(*debounce) return 0;
-	int pressed = 1;
+	int pressed = 0;
+	int alt = 0;
+	int shift = 0;
+	int win = 0;
+	 
+		win   |= (GetAsyncKeyState(VK_LWIN) & 0x8000  || GetAsyncKeyState(VK_RWIN) & 0x8000) ? 1 : 0;
+		alt   |= (GetAsyncKeyState(VK_RMENU) & 0x8000 || GetAsyncKeyState(VK_LMENU) & 0x8000) ? 1 : 0;
+		shift |= (GetAsyncKeyState(VK_LSHIFT) & 0x8000 || GetAsyncKeyState(VK_RSHIFT) & 0x8000 ) ? 1 : 0; 
 	
-	if(key_s & keys_SHIFT)
-		pressed &= (GetAsyncKeyState(VK_LSHIFT) < 0 || GetAsyncKeyState(VK_RSHIFT) < 0) ? 1 : 0; 
-	if(key_s & keys_WIN)
-		pressed &= (GetAsyncKeyState(VK_LWIN) < 0  || GetAsyncKeyState(VK_RWIN) < 0) ? 1 : 0;
-	if(key_s & keys_F)
-		pressed &= GetAsyncKeyState('F') < 0 ? 1 : 0;
-	if(key_s & keys_V)
-		pressed &= GetAsyncKeyState('V') < 0 ? 1 : 0;
-	if(key_s & keys_B)
-		pressed &= GetAsyncKeyState('B') < 0 ? 1 : 0;
-	if(key_s & keys_N)
-		pressed &= GetAsyncKeyState('N') < 0 ? 1 : 0; 
-	if(key_s & keys_H)
-		pressed &= GetAsyncKeyState('H') < 0 ? 1 : 0;
-	if(key_s & keys_S)
-		pressed &= GetAsyncKeyState('S') < 0 ? 1 : 0;
-	if(key_s & keys_L)
-		pressed &= GetAsyncKeyState('L') < 0 ? 1 : 0;
-	if(key_s & keys_Q)
-		pressed &= GetAsyncKeyState('Q') < 0 ? 1 : 0;
-	if(key_s & keys_Z)
-		pressed &= GetAsyncKeyState('Z') < 0 ? 1 : 0;
-	if(key_s & keys_E)
-		pressed &= GetAsyncKeyState('E') < 0 ? 1 : 0;
-	if(key_s & keys_C)
-		pressed &= GetAsyncKeyState('C') < 0 ? 1 : 0;
+		
+	if(win && !shift && !alt) {
+		printf("WIN\n");
+		if(key_s & keys_Q)
+			pressed |= GetAsyncKeyState('Q') < 0 ? 1 : 0;
+		if(key_s & keys_Z)
+			pressed |= GetAsyncKeyState('Z') < 0 ? 1 : 0;
+		if(key_s & keys_S)
+			pressed |= GetAsyncKeyState('S') < 0 ? 1 : 0;
+		if(key_s & keys_F)
+			pressed |= GetAsyncKeyState('F') < 0 ? 1 : 0;	
+	}
 	
+	if(key_s & keys_ALT && win && alt && !shift) {
+		printf("WIN+ALT\n");
+		if(key_s & keys_S)
+			pressed |= GetAsyncKeyState('S') < 0 ? 1 : 0;
+		if(key_s & keys_L)
+			pressed |= GetAsyncKeyState('L') < 0 ? 1 : 0;
+	}
+		
+    if(key_s & keys_SHIFT && win && shift && !alt) {
+    	printf("WIN + SHIFT\n");
+		if(key_s & keys_N)
+			pressed |= GetAsyncKeyState('N') < 0 ? 1 : 0;
+		if(key_s & keys_B)
+			pressed |= GetAsyncKeyState('B') < 0 ? 1 : 0;
+		if(key_s & keys_V)
+			pressed |= GetAsyncKeyState('V') < 0 ? 1 : 0;
+		if(key_s & keys_H)
+			pressed |= GetAsyncKeyState('H') < 0 ? 1 : 0; 
+		if(key_s & keys_L)
+			pressed |= GetAsyncKeyState('L') < 0 ? 1 : 0;
+		if(key_s & keys_E)
+			pressed |= GetAsyncKeyState('E') < 0 ? 1 : 0;
+		if(key_s & keys_C)
+			pressed |= GetAsyncKeyState('C') < 0 ? 1 : 0;
+	}
 	*debounce = pressed*4;
 	
 	return pressed;
@@ -279,6 +334,7 @@ int main(int argc, char *argv[]) {
 	_KSYSTEM_TIME st;
 	char* bgPaths = malloc((MAX_PATH*MAX_BGS)+MAX_BGS+1);
 	char** bgs = malloc(MAX_BGS*sizeof(char*));
+	int* settings = malloc(3*sizeof(int));
 	char orgPaper[MAX_PATH] = {0x00};
 	int nsfwIndex = 4000;
 	int running = 1;
@@ -286,8 +342,9 @@ int main(int argc, char *argv[]) {
 	int prevInd = 0;
 	int curbg = 0;
 	int loops = 0;
-	int loop_pause = 0;
-	int nsfw = 0;
+	settings[loop_pause] = 0;
+	settings[nsfw] = 0;
+	settings[onlyFavs] = 0;
 	int prev[MAX_HISTORY] = {0x00};
 	prev[0] = 0;
 	intStack* favs = malloc(sizeof(intStack));
@@ -329,10 +386,10 @@ int main(int argc, char *argv[]) {
 	int numBgs = initBGs(relpath,bgs,bgPaths,orgPaper,&nsfwIndex);
 	
 	importFavs(efavfpath,favs,bgs,numBgs);
-	
+	loadSettings(efavfpath,&settings);
 	if(nsfwIndex < 2){
 		printf("!!!!! Only NSFW images Loaded, NSFW enabled !!!!!\n");
-		nsfw = 1;
+		settings[nsfw] = 1;
 	}
 	//get a handle to the desktop to recieve show/hide icon messages
 	HWND hShellViewWin = gethShellViewWin();
@@ -344,22 +401,22 @@ int main(int argc, char *argv[]) {
 	int approxMinToms = approx_minutes * 700;
 	int nextBg = 0;
 	int something_pressed = 0;
-	int onlyFavs = 0;
+
 	while(running) {
 		if(something_pressed > 0) 
 			something_pressed--;
 			
-		if(!nsfw) {
+		if(!settings[nsfw]) {
 			nextBg = (rand()%(nsfwIndex-1))+2;
 		} else {
-			nextBg = nsfw == 2 ? (rand()%(numBgs-(nsfwIndex+1)))+nsfwIndex : (rand()%(numBgs-1))+1;
+			nextBg = settings[nsfw] == 2 ? (rand()%(numBgs-(nsfwIndex+1)))+nsfwIndex : (rand()%(numBgs-1))+1;
 		}
 
 		// every ~2 minutes update the BG or on Super-Shift+N for next or B for previous
-		if(loops >= approxMinToms && !loop_pause) {
+		if(loops >= approxMinToms && !settings[loop_pause]) {
 			loops = 0;
-			if(onlyFavs){
-				int nextFfavs = nextFav(bgs,favs,nsfw);
+			if(settings[onlyFavs]){
+				int nextFfavs = nextFav(bgs,favs,settings[nsfw]);
 				curbg = (nextFfavs == -1 ? curbg : nextFfavs);
 			} else {
 				if(++prevInd%MAX_HISTORY == 0) prevInd++;
@@ -389,16 +446,25 @@ int main(int argc, char *argv[]) {
 		
 		//Super-F    = Load saved favs (roatating pointer from last in, does not pop favs from list)
 		if(checkHotkey(keys_WIN | keys_F, &something_pressed)) {
-			int nextFfavs = nextFav(bgs,favs,nsfw);
+			int nextFfavs = nextFav(bgs,favs,settings[nsfw]);
 			curbg = (nextFfavs == -1 ? curbg : nextFfavs);
 		}
-
+		
+		//Super+ALT-S Save Settings
+		if(checkHotkey(keys_WIN | keys_ALT | keys_S, &something_pressed)) {
+				saveSettings(efavfpath,&settings);
+		}
+		
+		//Super+ALT-L Re-load Saved Settings
+		if(checkHotkey(keys_WIN | keys_ALT | keys_L, &something_pressed)) {
+				loadSettings(efavfpath,&settings);
+		}
 
 		//Super+Shift-N = go to next random image
 		if(checkHotkey(keys_WIN | keys_SHIFT | keys_N, &something_pressed)) {
 				loops = 0;
-				if(onlyFavs){
-					int nextFfavs = nextFav(bgs,favs,nsfw);
+				if(settings[onlyFavs]){
+					int nextFfavs = nextFav(bgs,favs,settings[nsfw]);
 					curbg = (nextFfavs == -1 ? curbg : nextFfavs);
 				} else {
 					if(++prevInd%MAX_HISTORY == 0) prevInd++;
@@ -424,20 +490,20 @@ int main(int argc, char *argv[]) {
 
 		//Super+Shift-V = pause timed cycling
 		if(checkHotkey(keys_WIN | keys_SHIFT | keys_V, &something_pressed)) {
-				loop_pause ^= 1;
-				if(!loop_pause) loops = 1400;
+				settings[loop_pause] ^= 1;
+				if(!settings[loop_pause]) loops = 1400;
 		}
 		
 		//Super+Shift-H = toggle NSFW
 		if(checkHotkey(keys_WIN | keys_SHIFT | keys_H, &something_pressed)) {
-				nsfw = ++nsfw % 3;
-				printf("NSFW:%d\n",nsfw);
+				settings[nsfw] = ++settings[nsfw] % 3;
+				printf("NSFW:%d\n",settings[nsfw]);
 		}
 		
 		//Super+Shift-L = only cycle favorites
 		if(checkHotkey(keys_WIN | keys_SHIFT | keys_L, &something_pressed)) {
-				onlyFavs ^= 1;
-				printf("Cycle:%s\n",(onlyFavs ? "Only Favorites" : "Normal"));
+				settings[onlyFavs] ^= 1;
+				printf("Cycle:%s\n",(settings[onlyFavs] ? "Only Favorites" : "Normal"));
 		}
 		
 		//Super+Shift-E = Export Favorites
