@@ -366,3 +366,6 @@ MigrationBackup/
 FodyWeavers.xsd
 Example/BackgroundHotkeyThingV0.9.zip
 Example/BGs/BackgroundHotkeyThing.ini
+BackgroundHotkeyThing_private.h
+BackgroundHotkeyThing_private.rc
+BackgroundHotkeyThing_private.res
