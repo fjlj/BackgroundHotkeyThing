@@ -25,7 +25,7 @@ BackgroundHotkeyThing.exe <absolute or relative path to png/jpg/bmp files> <numb
 # Hotkeys
 - Win+Shift-N - Set next Background
 - Win+Shift-B - Set previous Background
-- Win+Shift-V - Pause Auto Rotate
+- Win+Alt-V   - Pause Auto Rotate
 - Win+Shift-H - Change NSFW Mode (0/3rd press - Off, 1st press - Combined, 2nd press - Only NSFW)
 - Win+Shift-L - Only Cycle favorites (will not display NSFW favorites if NSFW mode is off)
 - Win+Shift-E - Export Favorited to file (located in provided wallpaper path as BackgroundHotkeyThing.ini)
@@ -34,7 +34,9 @@ BackgroundHotkeyThing.exe <absolute or relative path to png/jpg/bmp files> <numb
 - Win+Alt-S   - Save Current Settings (Paused/NSFW/Only Favorites)
 - Win+Alt-L   - Re-load saved Settings
 
-- Win-Z       - Toggle show/hide desktop icons
-- Win-S       - Save current background into top of favorites (sets load position to top)
-- Win-F       - Load favorite at top slot (starts at top and goes backward)
-- Win-Q       - Quit
+- Win+Shift-Z - Toggle show/hide desktop icons
+- Win+Alt-N   - Toggle toast notifications
+- Win+Shift-O - Open current background in File Explorer
+- Win+Shift-A - Save current background into top of favorites (sets load position to top)
+- Win+Shift-F - Load favorite at top slot (starts at top and goes backward)
+- Win+Alt-Q   - Quit
