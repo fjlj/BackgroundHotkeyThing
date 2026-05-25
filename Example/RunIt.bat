@@ -1,1 +1,1 @@
-start  %cd%\BackgroundHotkeyThing.exe BGs 1
+start  %cd%\BackgroundHotkeyThing.exe %cd%\BGs 1
