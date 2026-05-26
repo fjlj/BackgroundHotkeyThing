@@ -19,7 +19,7 @@ Customize rotation speed (its an approximation of seconds, good enough and adds 
 
 # Usage
 ```
-BackgroundHotkeyThing.exe <absolute or relative path to png/jpg/bmp files> <number of seconds to delay rotation>
+BackgroundHotkeyThing.exe <absolute or relative path to png/jpg/bmp files> <number of minutes to delay rotation>
 ```
 
 # Hotkeys
