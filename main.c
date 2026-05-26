@@ -101,9 +101,10 @@ int ListDirectoryContents(const char *sDir, char*** bgs_ptr, int* capacity, cons
 		   strstr(ext,strrchr(fdFile.cFileName,'.')) != NULL) {
 		   	
 			if (ind >= *capacity) {
-				*capacity *= 2;
-				char** new_bgs = realloc(*bgs_ptr, *capacity * sizeof(char*));
+				size_t new_capacity = *capacity * 2;
+				char** new_bgs = realloc(*bgs_ptr, new_capacity * sizeof(char*));
 				if (!new_bgs) return ind; // Handle out of memory gracefully
+				*capacity = new_capacity;
 				*bgs_ptr = new_bgs;
 			}
 
