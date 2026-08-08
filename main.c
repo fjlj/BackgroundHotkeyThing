@@ -1,7 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <shellapi.h>
-#include <stdio.h>
 
 #ifndef MOD_NOREPEAT
 #define MOD_NOREPEAT 0x4000
@@ -11,21 +10,33 @@
 #define MAX_iSTACK_SIZE 10
 #define SystemTimePointer ((_KSYSTEM_TIME*)0x7FFE0014)
 #define IDI_APP_ICON 101
-#define TOAST_DURATION_MS 200
+#define TOAST_DURATION_MS 1500
 
 #define APP_NAME "BackgroundHotkeyThing"
 #define APP_CLASS "BgHotkeyMsgWindow"
 #define INI_FILENAME "BackgroundHotkeyThing.ini"
 #define INI_SEC_SETTINGS "Settings"
 #define INI_SEC_FAVS "Favs"
+#define MUTEX_NAME "Local\\BackgroundHotkeyThing_SingleInstance"
 #define TIMER_MAIN 1
 #define TIMER_TOAST 2
+#define TIMER_HOLD 3
 #define DEFAULT_NSFW_INDEX 4000
 #define MS_PER_MIN 60000
+//hold next/prev: first extra step after this, then this often (wallpaper set isnt free)
+#define HOLD_INITIAL_MS 400
+#define HOLD_REPEAT_MS 200
+#define HOLD_NONE 0
+#define HOLD_NEXT 1
+#define HOLD_PREV 2
 
+//flip this on when you want to snoop via DebugView / a debugger
 //#define DEBUG
 
-#ifndef DEBUG
+#ifdef DEBUG
+	//wsprintfA + OutputDebugString - no stdio tax, still a real printf-shaped thing
+	#define printf(...) do { char _dbg[1024]; wsprintfA(_dbg, __VA_ARGS__); OutputDebugStringA(_dbg); } while(0)
+#else
 	#define printf(...) 
 #endif
 
@@ -33,7 +44,6 @@ typedef enum {
 	HK_QUIT = 1,
 	HK_TOGGLE_ICONS,
 	HK_SAVE_FAV,
-	HK_LOAD_FAV,
 	HK_SAVE_SETTINGS,
 	HK_LOAD_SETTINGS,
 	HK_NEXT_BG,
@@ -41,7 +51,6 @@ typedef enum {
 	HK_PAUSE,
 	HK_TOGGLE_NSFW,
 	HK_CYCLE_FAVS,
-	HK_EXPORT_FAVS,
 	HK_CLEAR_FAVS,
 	HK_OPEN_EXPLORER,
 	HK_TOGGLE_NOTIF
@@ -54,14 +63,14 @@ typedef struct {
 	int notifications;
 } AppSettings;
 
-//struct to get system time from KUSER_SHARED_DATA pointer
+//KUSER_SHARED_DATA system time fields (usermode mapping @ 0x7FFE0000)
 typedef struct {
 	ULONG LowPart;
 	LONG High1Time;
 	LONG High2Time;
 } _KSYSTEM_TIME;
 
-//integer stack struct
+//favorites stack: upsert-to-top, FIFO-drop oldest when full
 typedef struct intStack {
 	__int64 top;
 	__int64 pointer;
@@ -73,22 +82,140 @@ typedef struct {
 	int numBgs;
 	int nsfwIndex;
 	int curbg;
+	//prev[] = advances only. prevInd==-1 is "home" (launch wallpaper, bgs[0])
 	int prev[MAX_HISTORY];
 	int prevInd;
 	intStack* favs;
 } AppState;
 
-//get all the paths in a folder that match a pattern
-int ListDirectoryContents(const char *sDir, char*** bgs_ptr, int* capacity, const char* ext, int *nsfwInd) {
+AppSettings settings = {0};
+//folder counts for tray tip / menu (slot 0 is launch snapshot, not counted)
+int g_sfwCount = 0;
+int g_nsfwCount = 0;
+static unsigned int g_rng = 1;
+
+//tiny libc-free helpers so we dont drag stdio/stdlib into a wallpaper toy
+void* xmalloc(size_t n) {
+	return HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, n);
+}
+void* xrealloc(void* p, size_t n) {
+	if(!p) return xmalloc(n);
+	return HeapReAlloc(GetProcessHeap(), 0, p, n);
+}
+void xfree(void* p) {
+	if(p) HeapFree(GetProcessHeap(), 0, p);
+}
+
+void seedRng(unsigned int s) {
+	g_rng = s ? s : 1;
+}
+
+//classic LCG - good enough to pick wallpapers, not for crypto obviously
+int nextRand(void) {
+	g_rng = g_rng * 1103515245u + 12345u;
+	return (int)((g_rng >> 16) & 0x7FFF);
+}
+
+//positive ints only (rotation minutes). garbage -> 0
+int parsePositiveInt(const char* s) {
+	int n = 0;
+	if(!s || !*s) return 0;
+	for(; *s; s++) {
+		if(*s < '0' || *s > '9') return 0;
+		n = n * 10 + (*s - '0');
+	}
+	return n;
+}
+
+char* lastPathSep(char* s) {
+	char* p = NULL;
+	for(; *s; s++) {
+		if(*s == '\\' || *s == '/') p = s;
+	}
+	return p;
+}
+
+const char* lastDot(const char* s) {
+	const char* p = NULL;
+	for(; *s; s++) {
+		if(*s == '.') p = s;
+	}
+	return p;
+}
+
+//drive / UNC / \\?\ / root-relative = absolute. BGs / .\BGs / ..\x = relative
+int isAbsoluteWinPath(const char* p) {
+	if(!p || !p[0]) return 0;
+	if(p[0] == '\\' && p[1] == '\\') return 1;
+	if(p[0] == '\\' || p[0] == '/') return 1;
+	if(((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':') {
+		if(p[2] == '\0' || p[2] == '\\' || p[2] == '/') return 1;
+	}
+	return 0;
+}
+
+//absolute/UNC stay rooted; relative hangs off the *exe* dir (not cwd - shortcuts thank us)
+int resolveBgPath(const char* input, char* out, DWORD outSize) {
+	char combined[MAX_PATH] = {0};
+
+	if(!input || !input[0] || !out || outSize < 2) return 0;
+
+	if(isAbsoluteWinPath(input)) {
+		DWORD n = GetFullPathNameA(input, outSize, out, NULL);
+		if(n == 0 || n >= outSize) {
+			lstrcpynA(out, input, (int)outSize);
+		}
+		return 1;
+	}
+
+	char exePath[MAX_PATH] = {0};
+	if(!GetModuleFileNameA(NULL, exePath, MAX_PATH)) return 0;
+	char* slash = lastPathSep(exePath);
+	if(slash) *slash = '\0';
+	else {
+		lstrcpynA(out, input, (int)outSize);
+		return 1;
+	}
+
+	wsprintfA(combined, "%s\\%s", exePath, input);
+	DWORD n = GetFullPathNameA(combined, outSize, out, NULL);
+	if(n == 0 || n >= outSize) {
+		lstrcpynA(out, combined, (int)outSize);
+	}
+	printf("Resolved relative path:\n  in : %s\n  out: %s\n", input, out);
+	return 1;
+}
+
+//png/jpg/jpeg/bmp, case-insensitive. no extension = kick rocks
+int hasAllowedExt(const char* fileName) {
+	const char* dot = lastDot(fileName);
+	if(!dot || !dot[1]) return 0;
+	if(lstrcmpiA(dot, ".png") == 0) return 1;
+	if(lstrcmpiA(dot, ".jpg") == 0) return 1;
+	if(lstrcmpiA(dot, ".jpeg") == 0) return 1;
+	if(lstrcmpiA(dot, ".bmp") == 0) return 1;
+	return 0;
+}
+
+//random in [lo, hi] inclusive; busted range just hands back lo
+int randRange(int lo, int hi) {
+	if(hi < lo) return lo;
+	int span = hi - lo + 1;
+	if(span <= 1) return lo;
+	return lo + (nextRand() % span);
+}
+
+//SFW first (ind starts at 1; slot 0 is reserved for launch wallpaper), then NSFW folder
+int ListDirectoryContents(const char *sDir, char*** bgs_ptr, int* capacity, int *nsfwInd) {
 	WIN32_FIND_DATA fdFile;
 	HANDLE hFind = NULL;
 	char sPath[MAX_PATH] = {0};
 	char NSFWpath[MAX_PATH] = {0};
 
 	int ind = 1;
-	//Specify a file mask. *.* = We want everything!
-	sprintf_s(sPath,MAX_PATH, "%s\\%s", sDir,"*.*");
-	sprintf_s(NSFWpath,MAX_PATH, "%s\\NSFW\\%s", sDir,"*.*");
+	//*.* = everything, we filter extensions ourselves
+	wsprintfA(sPath, "%s\\*.*", sDir);
+	wsprintfA(NSFWpath, "%s\\NSFW\\*.*", sDir);
 
 	if((hFind = FindFirstFile(sPath, &fdFile)) == INVALID_HANDLE_VALUE) {
 		return ind;
@@ -96,26 +223,26 @@ int ListDirectoryContents(const char *sDir, char*** bgs_ptr, int* capacity, cons
 
 	do {
 		if(!(fdFile.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && 
-		   strcmp(fdFile.cFileName, ".") != 0  && 
-		   strcmp(fdFile.cFileName, "..") != 0 && 
-		   strstr(ext,strrchr(fdFile.cFileName,'.')) != NULL) {
+		   lstrcmpA(fdFile.cFileName, ".") != 0  && 
+		   lstrcmpA(fdFile.cFileName, "..") != 0 && 
+		   hasAllowedExt(fdFile.cFileName)) {
 		   	
 			if (ind >= *capacity) {
 				size_t new_capacity = *capacity * 2;
-				char** new_bgs = realloc(*bgs_ptr, new_capacity * sizeof(char*));
-				if (!new_bgs) return ind; // Handle out of memory gracefully
-				*capacity = new_capacity;
+				char** new_bgs = xrealloc(*bgs_ptr, new_capacity * sizeof(char*));
+				if (!new_bgs) return ind;
+				*capacity = (int)new_capacity;
 				*bgs_ptr = new_bgs;
 			}
 
-			sprintf_s(sPath,MAX_PATH, "%s\\%s", sDir, fdFile.cFileName);
-			size_t slen = strlen(sPath)+1;
-			(*bgs_ptr)[ind] = malloc(slen);
-			memcpy((*bgs_ptr)[ind], sPath, slen);
+			wsprintfA(sPath, "%s\\%s", sDir, fdFile.cFileName);
+			size_t slen = (size_t)lstrlenA(sPath)+1;
+			(*bgs_ptr)[ind] = xmalloc(slen);
+			CopyMemory((*bgs_ptr)[ind], sPath, slen);
 			printf("File: %d:%s\n", ind, (*bgs_ptr)[ind]);
 			ind++;
 		}
-	} while(FindNextFile(hFind, &fdFile)); //Find the next file.
+	} while(FindNextFile(hFind, &fdFile));
 
 	FindClose(hFind); //Always, Always, clean things up!
 	*nsfwInd = ind;
@@ -126,32 +253,33 @@ int ListDirectoryContents(const char *sDir, char*** bgs_ptr, int* capacity, cons
 
 	do {
 		if(!(fdFile.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
-		   strcmp(fdFile.cFileName, ".") != 0 && 
-		   strcmp(fdFile.cFileName, "..") != 0 && 
-		   strstr(ext,strrchr(fdFile.cFileName,'.')) != NULL) {
+		   lstrcmpA(fdFile.cFileName, ".") != 0 && 
+		   lstrcmpA(fdFile.cFileName, "..") != 0 && 
+		   hasAllowedExt(fdFile.cFileName)) {
 		   	
 			if (ind >= *capacity) {
-				*capacity *= 2;
-				char** new_bgs = realloc(*bgs_ptr, *capacity * sizeof(char*));
+				size_t new_capacity = *capacity * 2;
+				char** new_bgs = xrealloc(*bgs_ptr, new_capacity * sizeof(char*));
 				if (!new_bgs) return ind;
+				*capacity = (int)new_capacity;
 				*bgs_ptr = new_bgs;
 			}
 
-			sprintf_s(NSFWpath,MAX_PATH, "%s\\NSFW\\%s", sDir, fdFile.cFileName);
-			size_t slen = strlen(NSFWpath)+1;
-			(*bgs_ptr)[ind] = malloc(slen);
-			memcpy((*bgs_ptr)[ind], NSFWpath, slen);
+			wsprintfA(NSFWpath, "%s\\NSFW\\%s", sDir, fdFile.cFileName);
+			size_t slen = (size_t)lstrlenA(NSFWpath)+1;
+			(*bgs_ptr)[ind] = xmalloc(slen);
+			CopyMemory((*bgs_ptr)[ind], NSFWpath, slen);
 			printf("File: %d:%s\n", ind, (*bgs_ptr)[ind]);
 			ind++;
 		}
-	} while(FindNextFile(hFind, &fdFile)); //Find the next file.
+	} while(FindNextFile(hFind, &fdFile));
 
 	FindClose(hFind); //Always, Always, clean things up!
 
 	return ind;
 }
 
-//find the desktop window for message handling (hide/show desktop icons)
+//desktop listview host - Progman first, then WorkerW scavenger hunt (icon hide/show)
 HWND gethShellViewWin() {
 	HWND prgMan = FindWindowA("Progman", "Program Manager");
 	HWND hShellViewWin = FindWindowExA(prgMan, 0, "SHELLDLL_DefView", "");
@@ -166,15 +294,33 @@ HWND gethShellViewWin() {
 	return hShellViewWin;
 }
 
-//increment top of stack add entry to top of stack
-//if we would go out of bounds.. shift the data down by 1 index and write it to the top.
+int findInIntStack(intStack* stack, int data) {
+	for(int i = 0; i <= stack->top; i++) {
+		if(stack->inds[i] == data) return i;
+	}
+	return -1;
+}
+
+//yank one slot and close the gap (upsert helper)
+void removeIntStackAt(intStack* stack, int idx) {
+	if(idx < 0 || idx > stack->top) return;
+	if(idx < stack->top) {
+		MoveMemory(&stack->inds[idx], &stack->inds[idx + 1],
+			sizeof(int) * (size_t)(stack->top - idx));
+	}
+	stack->top--;
+	if(stack->top < -1) stack->top = -1;
+	stack->pointer = stack->top;
+}
+
+//push to top; if full, shift down (drop oldest) and write top
 //also returns the data written... (not really needed but eh why not)
 int pushIntStack(intStack* stack, int data){
 	
 	stack->top++;
 	if(stack->top >= MAX_iSTACK_SIZE){
 		stack->top = MAX_iSTACK_SIZE - 1;
-		memmove(stack->inds,&stack->inds[1],(sizeof(int)*(MAX_iSTACK_SIZE-1)));
+		MoveMemory(stack->inds,&stack->inds[1],(sizeof(int)*(MAX_iSTACK_SIZE-1)));
 		stack->inds[stack->top] = data;
 		stack->pointer = stack->top;
 		return data;
@@ -185,20 +331,17 @@ int pushIntStack(intStack* stack, int data){
 	return data;
 }
 
-//remove top entry from stack and return its value (not technically removed
-//decrements the top index.
-int popIntStack(intStack* stack){
-	if(stack->top <= -1){ stack->top = -1; return 0; }
-	int data = stack->inds[stack->top];
-	if(--stack->top < 0) stack->top = 0; 
-	stack->pointer = stack->top;
-	return data;
+//already in list? pull it out and re-push to top. full + brand new? FIFO drop oldest.
+int upsertIntStack(intStack* stack, int data) {
+	int existing = findInIntStack(stack, data);
+	if(existing >= 0) {
+		removeIntStackAt(stack, existing);
+		printf("fav upsert: moved existing slot %d to top\n", existing);
+	}
+	return pushIntStack(stack, data);
 }
 
-//moves the "cursor" for the current "selected" position of the stack
-//used to iterate through loading favorites 
-//rotation is last to first entry
-//returns the current position and moves it down 1
+//walk favorites newest->oldest; wrap. returns current then steps pointer down 1
 int peekIntStackItr(intStack* stack){
 	if(stack->top <= -1) { stack->top = -1; return 0; }
 	int data = stack->inds[stack->pointer];
@@ -207,7 +350,6 @@ int peekIntStackItr(intStack* stack){
 	return data;
 }
 
-//used for debugging (prints all current favorites)
 void printFavs(intStack* favs,char **bgs){
 	printf("------Current Favorites------\n");
 	for(int i = 0; i <= favs->top; i++){
@@ -215,10 +357,14 @@ void printFavs(intStack* favs,char **bgs){
 	}
 }
 
-void exportFavs(char* efavfpath,intStack* favs, char **bgs){
+//wipe [Favs] then rewrite so we dont leave ghost Fav-N slots behind
+void saveFavs(char* efavfpath,intStack* favs, char **bgs){
+	WritePrivateProfileStringA(INI_SEC_FAVS, NULL, NULL, efavfpath);
+	if(favs->top < 0) return;
+
 	char slotName[16] = {0};
 	for(int i = 0; i <= favs->top; i++){
-		sprintf_s(slotName,16,"Fav-%d",i);
+		wsprintfA(slotName,"Fav-%d",i);
 		WritePrivateProfileStringA(
 			INI_SEC_FAVS,
 			slotName,
@@ -227,31 +373,31 @@ void exportFavs(char* efavfpath,intStack* favs, char **bgs){
 	}  
 }
 
-void saveSettings(char* efavfpath, AppSettings* settings) {
+void saveSettings(char* efavfpath, AppSettings* s) {
 	char ival[8] = {0};
-	sprintf_s(ival, 8, "%d", settings->onlyFavs);
+	wsprintfA(ival, "%d", s->onlyFavs);
 	WritePrivateProfileStringA(INI_SEC_SETTINGS, "Set-0", ival, efavfpath);
-	sprintf_s(ival, 8, "%d", settings->nsfw);
+	wsprintfA(ival, "%d", s->nsfw);
 	WritePrivateProfileStringA(INI_SEC_SETTINGS, "Set-1", ival, efavfpath);
-	sprintf_s(ival, 8, "%d", settings->loop_pause);
+	wsprintfA(ival, "%d", s->loop_pause);
 	WritePrivateProfileStringA(INI_SEC_SETTINGS, "Set-2", ival, efavfpath);
-	sprintf_s(ival, 8, "%d", settings->notifications);
+	wsprintfA(ival, "%d", s->notifications);
 	WritePrivateProfileStringA(INI_SEC_SETTINGS, "Set-3", ival, efavfpath);
 }
 
-void loadSettings(char* efavfpath, AppSettings* settings) {
-	settings->onlyFavs = GetPrivateProfileIntA(INI_SEC_SETTINGS, "Set-0", settings->onlyFavs, efavfpath);
-	settings->nsfw = GetPrivateProfileIntA(INI_SEC_SETTINGS, "Set-1", settings->nsfw, efavfpath);
-	settings->loop_pause = GetPrivateProfileIntA(INI_SEC_SETTINGS, "Set-2", settings->loop_pause, efavfpath);
-	settings->notifications = GetPrivateProfileIntA(INI_SEC_SETTINGS, "Set-3", settings->notifications, efavfpath);
+void loadSettings(char* efavfpath, AppSettings* s) {
+	s->onlyFavs = GetPrivateProfileIntA(INI_SEC_SETTINGS, "Set-0", s->onlyFavs, efavfpath);
+	s->nsfw = GetPrivateProfileIntA(INI_SEC_SETTINGS, "Set-1", s->nsfw, efavfpath);
+	s->loop_pause = GetPrivateProfileIntA(INI_SEC_SETTINGS, "Set-2", s->loop_pause, efavfpath);
+	s->notifications = GetPrivateProfileIntA(INI_SEC_SETTINGS, "Set-3", s->notifications, efavfpath);
 }
 
 void importFavs(char* efavfpath, intStack* favs,char* bgs[],int numBgs){
 	char favPath[MAX_PATH] = {0x00};
 	char slotName[16] = {0};
-	for(int i = 0; i <= MAX_iSTACK_SIZE; i++){
+	for(int i = 0; i < MAX_iSTACK_SIZE; i++){
 		
-		sprintf_s(slotName,16,"Fav-%d",i);
+		wsprintfA(slotName,"Fav-%d",i);
 		
 		if(!GetPrivateProfileStringA(
 	  		INI_SEC_FAVS,
@@ -263,46 +409,76 @@ void importFavs(char* efavfpath, intStack* favs,char* bgs[],int numBgs){
 		) break;
 	    
 	    for(int o = 0; o < numBgs; o++){
-			if(strcmp(bgs[o], favPath) == 0){
+			if(lstrcmpA(bgs[o], favPath) == 0){
+				//import oldest->newest with plain push (upsert would reshuffle on load)
 				pushIntStack(favs,o);
+				break;
 			}
 		} 	
 	}	    
 }
 
-int nextFav(char** bgs, intStack* favs, int nsfw) {
-	int favsp = favs->pointer;
-	int favSlot = peekIntStackItr(favs);
-	if(!strstr(bgs[favSlot],"NSFW") || nsfw > 0){
-		printf("load fav[%d] = %d - bg: %s\n",favsp,favSlot,bgs[favSlot]);
-		SystemParametersInfo(SPI_SETDESKWALLPAPER,0,bgs[favSlot],SPIF_SENDCHANGE);
-		return favSlot;
+//home lives outside the ring (prevInd==-1 / bgs[0]). prev[] is advances only -
+//filling the ring never steals your way back to the launch wallpaper.
+void historyPush(AppState* state, int bgInd) {
+	if(state->prevInd < 0) {
+		state->prevInd = 0;
+		state->prev[0] = bgInd;
+	} else if(state->prevInd < MAX_HISTORY - 1) {
+		state->prev[++state->prevInd] = bgInd;
+	} else {
+		MoveMemory(&state->prev[0], &state->prev[1], sizeof(int) * (MAX_HISTORY - 1));
+		state->prev[MAX_HISTORY - 1] = bgInd;
+		state->prevInd = MAX_HISTORY - 1;
 	}
-	printf("Not Loading NSFW favorite while NSFW mode disabled\n");
+	state->curbg = bgInd;
+}
+
+//nsfw partition starts at nsfwIndex. when nsfw mode is off, walk the whole fav
+//ring once and skip NSFW slots instead of stalling on the first one forever.
+int nextFav(AppState* state) {
+	if(state->favs->top < 0) return -1;
+
+	int attempts = (int)state->favs->top + 1;
+	for(int n = 0; n < attempts; n++) {
+		int favsp = (int)state->favs->pointer;
+		int favSlot = peekIntStackItr(state->favs);
+
+		if(favSlot < state->nsfwIndex || settings.nsfw > 0) {
+			printf("load fav[%d] = %d - bg: %s\n", favsp, favSlot, state->bgs[favSlot]);
+			SystemParametersInfo(SPI_SETDESKWALLPAPER, 0, state->bgs[favSlot], SPIF_SENDCHANGE);
+			return favSlot;
+		}
+		printf("skip NSFW fav[%d]=%d (nsfw mode off)\n", favsp, favSlot);
+	}
+
+	printf("No loadable favorites for current NSFW mode\n");
 	return -1;
 }
 
 int initBGs(char* relpath, AppState* appState, char* orgPaper){
-	//get the current BG and set it as the first in history
+	//snapshot their current desktop - bgs[0], start at home (prevInd=-1)
 	SystemParametersInfo(SPI_GETDESKWALLPAPER,MAX_PATH,orgPaper,0);
 	
-	int capacity = 1000; // Start with capacity for 1000 backgrounds
-	appState->bgs = malloc(capacity * sizeof(char*));
+	int capacity = 1000;
+	appState->bgs = xmalloc(capacity * sizeof(char*));
 	if (!appState->bgs) return 0;
 
-	size_t ogPathLen = strlen(orgPaper)+1;
-	appState->bgs[0] = malloc(ogPathLen);
-	memcpy(appState->bgs[0], orgPaper, ogPathLen);
+	size_t ogPathLen = (size_t)lstrlenA(orgPaper)+1;
+	appState->bgs[0] = xmalloc(ogPathLen);
+	CopyMemory(appState->bgs[0], orgPaper, ogPathLen);
 
-	//populate the paths and index arrays while getting the number of pngs
-	int numBgs = ListDirectoryContents(relpath, &(appState->bgs), &capacity, "*.png;*.jpg;*.bmp", &(appState->nsfwIndex));
+	appState->prevInd = -1;
+	appState->curbg = 0;
+
+	int numBgs = ListDirectoryContents(relpath, &(appState->bgs), &capacity, &(appState->nsfwIndex));
 
 	printf("%d Backgrounds Loaded.\nNSFW Begins at:%d\n",numBgs,appState->nsfwIndex);
 
-	// If numBgs is 1, it means we only found the original wallpaper and no new files
+	//numBgs==1 means we only have the launch snapshot, no folder images
 	if(numBgs <= 1) {
 		char errmsg[MAX_PATH+32];
-		sprintf_s(errmsg,MAX_PATH+32,"Path or Images not found at: [%s]\n",relpath);
+		wsprintfA(errmsg,"Path or Images not found at: [%s]\n",relpath);
 		MessageBoxA(0,errmsg,"Whoops!", 0);
 		return 0;
 	}
@@ -313,54 +489,116 @@ int initBGs(char* relpath, AppState* appState, char* orgPaper){
 #define WM_TRAYICON (WM_APP + 1)
 #define TRAY_ICON_ID 1
 
-AppSettings settings = {0};
-
 void AdvanceFavorite(AppState* state) {
-	int nextFfavs = nextFav(state->bgs, state->favs, settings.nsfw);
+	int nextFfavs = nextFav(state);
 	if(nextFfavs != -1){
-		state->curbg = nextFfavs;
-		if(++state->prevInd%MAX_HISTORY == 0) state->prevInd++;
-		if(state->prevInd >= MAX_HISTORY) state->prevInd = 1;
-		state->prev[state->prevInd%MAX_HISTORY] = state->curbg;
+		historyPush(state, nextFfavs);
 	}
 }
 
 void AdvanceBackground(AppState* state) {
 	if(settings.onlyFavs){
 		AdvanceFavorite(state);
-	} else {
-		int nextBg = 0;
-		if(!settings.nsfw) {
-			nextBg = (rand()%(state->nsfwIndex-1))+2;
-		} else {
-			nextBg = settings.nsfw == 2 ? (rand()%(state->numBgs-(state->nsfwIndex+1)))+state->nsfwIndex : (rand()%(state->numBgs-1))+1;
-		}
-		if(++state->prevInd%MAX_HISTORY == 0) state->prevInd++;
-		if(state->prevInd >= MAX_HISTORY) state->prevInd = 1;
-		state->curbg = nextBg;
-		state->prev[state->prevInd%MAX_HISTORY] = state->curbg;
-		printf("Setting:[%d]%s\n", state->curbg, state->bgs[state->curbg]);
-		SystemParametersInfo(SPI_SETDESKWALLPAPER, 0, state->bgs[state->curbg], SPIF_SENDCHANGE);
+		return;
 	}
+
+	int lo = 1;
+	int hi = state->numBgs - 1;
+
+	if(!settings.nsfw) {
+		//SFW only (skip index 0 = launch snapshot)
+		lo = 1;
+		hi = state->nsfwIndex - 1;
+	} else if(settings.nsfw == 2) {
+		lo = state->nsfwIndex;
+		hi = state->numBgs - 1;
+	} else {
+		//combined: everything loaded except the launch snapshot
+		lo = 1;
+		hi = state->numBgs - 1;
+	}
+
+	if(hi < lo) {
+		printf("No backgrounds available for current NSFW mode (lo=%d hi=%d)\n", lo, hi);
+		return;
+	}
+
+	int nextBg = randRange(lo, hi);
+	historyPush(state, nextBg);
+	printf("Setting:[%d]%s\n", state->curbg, state->bgs[state->curbg]);
+	SystemParametersInfo(SPI_SETDESKWALLPAPER, 0, state->bgs[state->curbg], SPIF_SENDCHANGE);
 }
 
 void PreviousBackground(AppState* state) {
-	if(state->prevInd <= 0) return;
-	if(--state->prevInd < 0) state->prevInd = 0;
-	if(state->prevInd == MAX_HISTORY) state->prevInd--;
-	state->curbg = state->prev[state->prevInd%MAX_HISTORY];
+	if(state->prevInd < 0) return; //already home
+
+	if(state->prevInd == 0) {
+		//step off oldest advance -> always restore launch wallpaper
+		state->prevInd = -1;
+		state->curbg = 0;
+	} else {
+		state->prevInd--;
+		state->curbg = state->prev[state->prevInd];
+	}
 	printf("Setting:[%d]%s\n", state->curbg, state->bgs[state->curbg]);
 	SystemParametersInfo(SPI_SETDESKWALLPAPER, 0, state->bgs[state->curbg], SPIF_SENDCHANGE);
+}
+
+int keyDown(int vk) {
+	return (GetAsyncKeyState(vk) & 0x8000) != 0;
+}
+
+int winKeyDown(void) {
+	return keyDown(VK_LWIN) || keyDown(VK_RWIN);
+}
+
+//still holding the registered combo? used for hold-to-cycle
+int isNextHeld(void) {
+	return winKeyDown() && keyDown(VK_SHIFT) && keyDown('N');
+}
+int isPrevHeld(void) {
+	return winKeyDown() && keyDown(VK_SHIFT) && keyDown('B');
+}
+
+void stopHoldCycle(UINT_PTR* holdTimer, int* holdDir) {
+	if(holdTimer && *holdTimer) {
+		KillTimer(NULL, *holdTimer);
+		*holdTimer = 0;
+	}
+	if(holdDir) *holdDir = HOLD_NONE;
+}
+
+void startHoldCycle(int dir, UINT_PTR* holdTimer, int* holdDir) {
+	*holdDir = dir;
+	if(*holdTimer) KillTimer(NULL, *holdTimer);
+	//first follow-up is a hair slower so a tap doesnt double-fire
+	*holdTimer = SetTimer(NULL, TIMER_HOLD, HOLD_INITIAL_MS, NULL);
+}
+
+void UpdateTrayTip(HWND hwnd) {
+	NOTIFYICONDATAA nid = {0};
+	nid.cbSize = sizeof(NOTIFYICONDATAA);
+	nid.hWnd = hwnd;
+	nid.uID = TRAY_ICON_ID;
+	nid.uFlags = NIF_TIP;
+	//szTip is 128 chars - plenty for a quick inventory
+	wsprintfA(nid.szTip, "%s\nSFW: %d | NSFW: %d", APP_NAME, g_sfwCount, g_nsfwCount);
+	Shell_NotifyIconA(NIM_MODIFY, &nid);
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 	switch(msg) {
 		case WM_TRAYICON:
-			// Handle Left and Right click on the tray icon
 			if (lParam == WM_RBUTTONUP || lParam == WM_LBUTTONUP) {
 				POINT pt;
 				GetCursorPos(&pt);
 				HMENU hMenu = CreatePopupMenu();
+
+				char infoLine[64];
+				wsprintfA(infoLine, "Loaded  SFW: %d  |  NSFW: %d", g_sfwCount, g_nsfwCount);
+				AppendMenuA(hMenu, MF_STRING | MF_GRAYED, 0, infoLine);
+				AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
+
 				AppendMenuA(hMenu, MF_STRING, HK_NEXT_BG, "Next Background\tWin+Shift-N");
 				AppendMenuA(hMenu, MF_STRING, HK_PREV_BG, "Previous Background\tWin+Shift-B");
 				AppendMenuA(hMenu, MF_STRING | (settings.loop_pause ? MF_CHECKED : MF_UNCHECKED), HK_PAUSE, "Toggle Pause\tWin+Alt-V");
@@ -368,11 +606,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				char nsfwMenuText[64];
 				UINT nsfwState = MF_UNCHECKED;
 				if (settings.nsfw == 0) {
-					strcpy_s(nsfwMenuText, sizeof(nsfwMenuText), "NSFW Mode: Off\tWin+Shift-H");
+					lstrcpynA(nsfwMenuText, "NSFW Mode: Off\tWin+Shift-H", sizeof(nsfwMenuText));
 				} else if (settings.nsfw == 1) {
-					strcpy_s(nsfwMenuText, sizeof(nsfwMenuText), "[-] NSFW Mode: Combined\tWin+Shift-H");
+					lstrcpynA(nsfwMenuText, "[-] NSFW Mode: Combined\tWin+Shift-H", sizeof(nsfwMenuText));
 				} else {
-					strcpy_s(nsfwMenuText, sizeof(nsfwMenuText), "NSFW Mode: Only NSFW\tWin+Shift-H");
+					lstrcpynA(nsfwMenuText, "NSFW Mode: Only NSFW\tWin+Shift-H", sizeof(nsfwMenuText));
 					nsfwState = MF_CHECKED;
 				}
 				AppendMenuA(hMenu, MF_STRING | nsfwState, HK_TOGGLE_NSFW, nsfwMenuText);
@@ -382,7 +620,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
 				AppendMenuA(hMenu, MF_STRING, HK_SAVE_FAV, "Save Favorite\tWin+Shift-A");
 				AppendMenuA(hMenu, MF_STRING, HK_CLEAR_FAVS, "Clear Favorites\tWin+Shift-C");
-				AppendMenuA(hMenu, MF_STRING, HK_EXPORT_FAVS, "Export Favorites\tWin+Shift-E");
 				AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
 				AppendMenuA(hMenu, MF_STRING, HK_SAVE_SETTINGS, "Save Settings\tWin+Alt-S");
 				AppendMenuA(hMenu, MF_STRING, HK_LOAD_SETTINGS, "Load Settings\tWin+Alt-L");
@@ -392,9 +629,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
 				AppendMenuA(hMenu, MF_STRING, HK_QUIT, "Quit\tWin+Alt-Q");
 				
-				SetForegroundWindow(hwnd); // Required to make menu disappear if you click away
+				SetForegroundWindow(hwnd); //menu needs this or it sticks around like a bad roommate
 				int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, NULL);
-				PostMessage(hwnd, WM_NULL, 0, 0); // Windows being windows...
+				PostMessage(hwnd, WM_NULL, 0, 0); //Windows being windows...
 				DestroyMenu(hMenu);
 				
 				if (cmd != 0) {
@@ -435,7 +672,7 @@ void InitTrayIcon(HWND hwnd) {
 	nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
 	nid.uCallbackMessage = WM_TRAYICON;
 	nid.hIcon = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_APP_ICON));
-	strcpy_s(nid.szTip, sizeof(nid.szTip), APP_NAME);
+	lstrcpynA(nid.szTip, APP_NAME, sizeof(nid.szTip));
 	Shell_NotifyIconA(NIM_ADD, &nid);
 }
 
@@ -455,8 +692,8 @@ void ShowNotification(HWND hwnd, const char* title, const char* message, int tim
 	nid.hWnd = hwnd;
 	nid.uID = TRAY_ICON_ID;
 	nid.uFlags = NIF_INFO;
-	strcpy_s(nid.szInfoTitle, sizeof(nid.szInfoTitle), title);
-	strcpy_s(nid.szInfo, sizeof(nid.szInfo), message);
+	lstrcpynA(nid.szInfoTitle, title, sizeof(nid.szInfoTitle));
+	lstrcpynA(nid.szInfo, message, sizeof(nid.szInfo));
 	nid.dwInfoFlags = NIIF_NOSOUND;
 	nid.uTimeout = timeoutMs;
 	Shell_NotifyIconA(NIM_MODIFY, &nid);
@@ -468,9 +705,19 @@ void ShowNotification(HWND hwnd, const char* title, const char* message, int tim
 	}
 }
 
-void HandleHotkey(int hotkeyId, AppState* appState, HWND hwnd, char* efavfpath, UINT_PTR* timerId, UINT timerInterval, int* running) {
+void bumpAutoTimer(UINT_PTR* timerId, UINT timerInterval) {
+	if (!settings.loop_pause) {
+		if (*timerId) KillTimer(NULL, *timerId);
+		*timerId = SetTimer(NULL, TIMER_MAIN, timerInterval, NULL);
+	}
+}
+
+void HandleHotkey(int hotkeyId, AppState* appState, HWND hwnd, char* efavfpath,
+	UINT_PTR* timerId, UINT timerInterval, int* running,
+	UINT_PTR* holdTimer, int* holdDir) {
 	switch (hotkeyId) {
 		case HK_QUIT:
+			stopHoldCycle(holdTimer, holdDir);
 			*running = 0;
 			break;
 		case HK_TOGGLE_ICONS:
@@ -480,15 +727,15 @@ void HandleHotkey(int hotkeyId, AppState* appState, HWND hwnd, char* efavfpath, 
 			}
 			break;
 		case HK_SAVE_FAV:
-			pushIntStack(appState->favs, appState->curbg);
+			upsertIntStack(appState->favs, appState->curbg);
+			saveFavs(efavfpath, appState->favs, appState->bgs);
 			printFavs(appState->favs, appState->bgs);
 			ShowNotification(hwnd, "Favorites", "Saved current background to favorites!", TOAST_DURATION_MS);
 			break;
-		case HK_LOAD_FAV:
-			AdvanceFavorite(appState);
-			break;
 		case HK_SAVE_SETTINGS:
+			//manual force-save still handy even though we autosave on change
 			saveSettings(efavfpath, &settings);
+			ShowNotification(hwnd, APP_NAME, "Settings saved", TOAST_DURATION_MS);
 			break;
 		case HK_LOAD_SETTINGS:
 			loadSettings(efavfpath, &settings);
@@ -497,22 +744,20 @@ void HandleHotkey(int hotkeyId, AppState* appState, HWND hwnd, char* efavfpath, 
 			if (!settings.loop_pause) {
 				*timerId = SetTimer(NULL, TIMER_MAIN, timerInterval, NULL);
 			}
+			ShowNotification(hwnd, APP_NAME, "Settings reloaded", TOAST_DURATION_MS);
 			break;
 		case HK_NEXT_BG:
-			if (!settings.loop_pause) {
-				if (*timerId) KillTimer(NULL, *timerId);
-				*timerId = SetTimer(NULL, TIMER_MAIN, timerInterval, NULL);
-			}
+			//tap = one step; hold = keep stepping via TIMER_HOLD + GetAsyncKeyState
+			bumpAutoTimer(timerId, timerInterval);
 			AdvanceBackground(appState);
+			startHoldCycle(HOLD_NEXT, holdTimer, holdDir);
 			break;
 		case HK_PREV_BG:
-			if(appState->prevInd > 0) {
-				if (!settings.loop_pause) {
-					if (*timerId) KillTimer(NULL, *timerId);
-					*timerId = SetTimer(NULL, TIMER_MAIN, timerInterval, NULL);
-				}
+			bumpAutoTimer(timerId, timerInterval);
+			if(appState->prevInd >= 0) {
 				PreviousBackground(appState);
 			}
+			startHoldCycle(HOLD_PREV, holdTimer, holdDir);
 			break;
 		case HK_PAUSE:
 			settings.loop_pause ^= 1;
@@ -525,6 +770,7 @@ void HandleHotkey(int hotkeyId, AppState* appState, HWND hwnd, char* efavfpath, 
 				*timerId = SetTimer(NULL, TIMER_MAIN, timerInterval, NULL);
 				ShowNotification(hwnd, APP_NAME, "Auto Rotate: Resumed", TOAST_DURATION_MS);
 			}
+			saveSettings(efavfpath, &settings);
 			break;
 		case HK_TOGGLE_NSFW:
 			settings.nsfw = ++settings.nsfw % 3;
@@ -532,37 +778,32 @@ void HandleHotkey(int hotkeyId, AppState* appState, HWND hwnd, char* efavfpath, 
 			if (settings.nsfw == 0) ShowNotification(hwnd, "NSFW Mode", "Off", TOAST_DURATION_MS);
 			else if (settings.nsfw == 1) ShowNotification(hwnd, "NSFW Mode", "Combined", TOAST_DURATION_MS);
 			else ShowNotification(hwnd, "NSFW Mode", "Only NSFW", TOAST_DURATION_MS);
+			saveSettings(efavfpath, &settings);
 			break;
 		case HK_CYCLE_FAVS:
 			settings.onlyFavs ^= 1;
 			printf("Cycle:%s\n", (settings.onlyFavs ? "Only Favorites" : "Normal"));
 			ShowNotification(hwnd, "Cycle Mode", settings.onlyFavs ? "Only Favorites" : "Normal", TOAST_DURATION_MS);
-			break;
-		case HK_EXPORT_FAVS:
-			printf("Exporting %d Favorites\n",appState->favs->top);
-			exportFavs(efavfpath,appState->favs,appState->bgs);
+			saveSettings(efavfpath, &settings);
 			break;
 		case HK_CLEAR_FAVS:
 			printf("Clearing Favorites\n");
-			WritePrivateProfileStringA(
-				INI_SEC_FAVS,
-				NULL,
-				NULL,
-				efavfpath);
 			appState->favs->top = -1;
 			appState->favs->pointer = 0;
-			memset(appState->favs->inds, 0, sizeof(int) * MAX_iSTACK_SIZE);
+			ZeroMemory(appState->favs->inds, sizeof(int) * MAX_iSTACK_SIZE);
+			saveFavs(efavfpath, appState->favs, appState->bgs);
 			ShowNotification(hwnd, "Favorites", "Cleared all favorites!", TOAST_DURATION_MS);
 			break;
 		case HK_OPEN_EXPLORER:
 			{
 				char args[MAX_PATH + 32] = {0};
-				sprintf_s(args, sizeof(args), "/select,\"%s\"", appState->bgs[appState->curbg]);
+				wsprintfA(args, "/select,\"%s\"", appState->bgs[appState->curbg]);
 				ShellExecuteA(NULL, "open", "explorer.exe", args, NULL, SW_SHOWNORMAL);
 			}
 			break;
 		case HK_TOGGLE_NOTIF:
 			settings.notifications ^= 1;
+			saveSettings(efavfpath, &settings);
 			if (settings.notifications) {
 				ShowNotification(hwnd, APP_NAME, "Notifications Enabled", TOAST_DURATION_MS);
 			}
@@ -573,25 +814,23 @@ void HandleHotkey(int hotkeyId, AppState* appState, HWND hwnd, char* efavfpath, 
 void RegisterAppHotkeys() {
 	char hkErrors[1024] = {0};
 
-	if(!RegisterHotKey(NULL, HK_QUIT, MOD_WIN | MOD_ALT | MOD_NOREPEAT, 'Q')) strcat(hkErrors, "- Win+Alt-Q (Quit)\n");
-	if(!RegisterHotKey(NULL, HK_TOGGLE_ICONS, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'Z')) strcat(hkErrors, "- Win+Shift-Z (Toggle Icons)\n");
-	if(!RegisterHotKey(NULL, HK_SAVE_FAV, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'A')) strcat(hkErrors, "- Win+Shift-A (Save Fav)\n");
-	if(!RegisterHotKey(NULL, HK_LOAD_FAV, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'F')) strcat(hkErrors, "- Win+Shift-F (Load Fav)\n");
-	if(!RegisterHotKey(NULL, HK_SAVE_SETTINGS, MOD_WIN | MOD_ALT | MOD_NOREPEAT, 'S')) strcat(hkErrors, "- Win+Alt-S (Save Settings)\n");
-	if(!RegisterHotKey(NULL, HK_LOAD_SETTINGS, MOD_WIN | MOD_ALT | MOD_NOREPEAT, 'L')) strcat(hkErrors, "- Win+Alt-L (Load Settings)\n");
-	if(!RegisterHotKey(NULL, HK_NEXT_BG, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'N')) strcat(hkErrors, "- Win+Shift-N (Next BG)\n");
-	if(!RegisterHotKey(NULL, HK_PREV_BG, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'B')) strcat(hkErrors, "- Win+Shift-B (Prev BG)\n");
-	if(!RegisterHotKey(NULL, HK_PAUSE, MOD_WIN | MOD_ALT | MOD_NOREPEAT, 'V')) strcat(hkErrors, "- Win+Alt-V (Pause)\n");
-	if(!RegisterHotKey(NULL, HK_TOGGLE_NSFW, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'H')) strcat(hkErrors, "- Win+Shift-H (Toggle NSFW)\n");
-	if(!RegisterHotKey(NULL, HK_CYCLE_FAVS, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'L')) strcat(hkErrors, "- Win+Shift-L (Cycle Favs)\n");
-	if(!RegisterHotKey(NULL, HK_EXPORT_FAVS, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'E')) strcat(hkErrors, "- Win+Shift-E (Export Favs)\n");
-	if(!RegisterHotKey(NULL, HK_CLEAR_FAVS, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'C')) strcat(hkErrors, "- Win+Shift-C (Clear Favs)\n");
-	if(!RegisterHotKey(NULL, HK_OPEN_EXPLORER, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'O')) strcat(hkErrors, "- Win+Shift-O (Open Explorer)\n");
-	if(!RegisterHotKey(NULL, HK_TOGGLE_NOTIF, MOD_WIN | MOD_ALT | MOD_NOREPEAT, 'N')) strcat(hkErrors, "- Win+Alt-N (Toggle Notifications)\n");
+	if(!RegisterHotKey(NULL, HK_QUIT, MOD_WIN | MOD_ALT | MOD_NOREPEAT, 'Q')) lstrcatA(hkErrors, "- Win+Alt-Q (Quit)\n");
+	if(!RegisterHotKey(NULL, HK_TOGGLE_ICONS, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'Z')) lstrcatA(hkErrors, "- Win+Shift-Z (Toggle Icons)\n");
+	if(!RegisterHotKey(NULL, HK_SAVE_FAV, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'A')) lstrcatA(hkErrors, "- Win+Shift-A (Save Fav)\n");
+	if(!RegisterHotKey(NULL, HK_SAVE_SETTINGS, MOD_WIN | MOD_ALT | MOD_NOREPEAT, 'S')) lstrcatA(hkErrors, "- Win+Alt-S (Save Settings)\n");
+	if(!RegisterHotKey(NULL, HK_LOAD_SETTINGS, MOD_WIN | MOD_ALT | MOD_NOREPEAT, 'L')) lstrcatA(hkErrors, "- Win+Alt-L (Load Settings)\n");
+	if(!RegisterHotKey(NULL, HK_NEXT_BG, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'N')) lstrcatA(hkErrors, "- Win+Shift-N (Next BG)\n");
+	if(!RegisterHotKey(NULL, HK_PREV_BG, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'B')) lstrcatA(hkErrors, "- Win+Shift-B (Prev BG)\n");
+	if(!RegisterHotKey(NULL, HK_PAUSE, MOD_WIN | MOD_ALT | MOD_NOREPEAT, 'V')) lstrcatA(hkErrors, "- Win+Alt-V (Pause)\n");
+	if(!RegisterHotKey(NULL, HK_TOGGLE_NSFW, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'H')) lstrcatA(hkErrors, "- Win+Shift-H (Toggle NSFW)\n");
+	if(!RegisterHotKey(NULL, HK_CYCLE_FAVS, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'L')) lstrcatA(hkErrors, "- Win+Shift-L (Cycle Favs)\n");
+	if(!RegisterHotKey(NULL, HK_CLEAR_FAVS, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'C')) lstrcatA(hkErrors, "- Win+Shift-C (Clear Favs)\n");
+	if(!RegisterHotKey(NULL, HK_OPEN_EXPLORER, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'O')) lstrcatA(hkErrors, "- Win+Shift-O (Open Explorer)\n");
+	if(!RegisterHotKey(NULL, HK_TOGGLE_NOTIF, MOD_WIN | MOD_ALT | MOD_NOREPEAT, 'N')) lstrcatA(hkErrors, "- Win+Alt-N (Toggle Notifications)\n");
 
 	if (hkErrors[0] != '\0') {
 		char errorMsg[2048] = {0};
-		sprintf_s(errorMsg, 2048, "The following hotkeys failed to register (they might be in use by Windows or another app):\n\n%s", hkErrors);
+		wsprintfA(errorMsg, "The following hotkeys failed to register (they might be in use by Windows or another app):\n\n%s", hkErrors);
 		MessageBoxA(0, errorMsg, "Hotkey Registration Warning", MB_ICONWARNING | MB_OK);
 	}
 }
@@ -609,24 +848,38 @@ HWND InitializeHiddenWindow() {
 	wc.hIcon = LoadIcon(wc.hInstance, MAKEINTRESOURCE(IDI_APP_ICON));
 	wc.lpszClassName = APP_CLASS;
 	RegisterClassA(&wc);
-	HWND hwnd = CreateWindowA(wc.lpszClassName, APP_NAME, 0, 0, 0, 0, 0, NULL, NULL, wc.hInstance, NULL); // Create hidden window
+	HWND hwnd = CreateWindowA(wc.lpszClassName, APP_NAME, 0, 0, 0, 0, 0, NULL, NULL, wc.hInstance, NULL);
 	InitTrayIcon(hwnd);
 	return hwnd;
 }
 
 int main(int argc, char *argv[]) {
+	//one instance only - second launch just nags and peaces out
+	HANDLE hMutex = CreateMutexA(NULL, FALSE, MUTEX_NAME);
+	if(!hMutex) {
+		MessageBoxA(0, "Failed to create single-instance mutex.", APP_NAME, MB_ICONERROR | MB_OK);
+		return 1;
+	}
+	if(GetLastError() == ERROR_ALREADY_EXISTS) {
+		MessageBoxA(0,
+			"BackgroundHotkeyThing is already running.\nCheck the tray / notification area.",
+			APP_NAME, MB_ICONINFORMATION | MB_OK);
+		CloseHandle(hMutex);
+		return 0;
+	}
+
 	_KSYSTEM_TIME st;
 	AppState appState = {0};
 	appState.nsfwIndex = DEFAULT_NSFW_INDEX;
-	appState.prev[0] = 0;
-	appState.favs = malloc(sizeof(intStack));
+	appState.favs = xmalloc(sizeof(intStack));
 	
 	if (!appState.favs) {
 		MessageBoxA(0, "Failed to allocate memory.", APP_NAME, MB_ICONERROR | MB_OK);
+		CloseHandle(hMutex);
 		return 1;
 	}
 	
-	memset(appState.favs->inds, 0, sizeof(int)*MAX_iSTACK_SIZE);
+	ZeroMemory(appState.favs->inds, sizeof(int)*MAX_iSTACK_SIZE);
 	appState.favs->top = -1;
 	appState.favs->pointer = 0;
 
@@ -639,44 +892,42 @@ int main(int argc, char *argv[]) {
 	settings.notifications = 1;
 
 	if(argc < 2) {
-		MessageBoxA(0,"Usage: BackgroundHotkeyThing.exe <path to BG images> <rotation delay in seconds>\nNOTE: single folder(non-recursive)\n","Woops",0);
+		MessageBoxA(0,"Usage: BackgroundHotkeyThing.exe <path to BG images> <rotation delay in minutes>\nNOTE: single folder(non-recursive)\n","Woops",0);
+		xfree(appState.favs);
+		CloseHandle(hMutex);
 		return 0;
 	}
 	
 	if(argc > 2) {
-		int tmp = atoi(argv[2]);
+		int tmp = parsePositiveInt(argv[2]);
 		approx_minutes = (tmp > 0  ? tmp : approx_minutes);
 	}
 	
 	char relpath[MAX_PATH] = {0};
-	memcpy(relpath,argv[1],strlen(argv[1]));
-	char exepath[MAX_PATH] = {0};
-	memcpy(exepath,argv[0],strlen(argv[0]));
-
-	//detect weather its an absolute or relative path and set accordingly
-	if(argv[1][0] == '.' || argv[1][1] != ':') {
-		memset(&relpath[0],0x00,MAX_PATH);
-		char* exenameBegin = strrchr(exepath,(int)'\\');
-		*exenameBegin = 0x00;
-		sprintf_s(relpath,MAX_PATH,"%s\\%s",exepath,argv[1]);
+	if(!resolveBgPath(argv[1], relpath, MAX_PATH)) {
+		MessageBoxA(0, "Could not resolve background folder path.", "Woops", MB_ICONERROR | MB_OK);
+		xfree(appState.favs);
+		CloseHandle(hMutex);
+		return 1;
 	}
+	printf("BG folder: %s\n", relpath);
 	
-	//set savepath
 	char efavfpath[MAX_PATH] = {0};
-	sprintf_s(efavfpath,MAX_PATH,"%s\\%s",relpath,INI_FILENAME);
+	wsprintfA(efavfpath, "%s\\%s", relpath, INI_FILENAME);
 	
-	//do some very basic random seeding via some ASLR and system time values from KUSER_SHARED_DATA...
-	memcpy(&st,SystemTimePointer,sizeof(st));
-	srand((unsigned int)((uintptr_t)&main + (uintptr_t)&ListDirectoryContents) + st.LowPart);
+	//very basic random seed: a little ASLR + SystemTime out of KUSER_SHARED_DATA...
+	CopyMemory(&st,SystemTimePointer,sizeof(st));
+	seedRng((unsigned int)((uintptr_t)&main + (uintptr_t)&ListDirectoryContents) + st.LowPart);
 	
 	appState.numBgs = initBGs(relpath, &appState, orgPaper);
 	
 	if(appState.numBgs == 0) {
 		if (appState.bgs) {
-			if (appState.bgs[0]) free(appState.bgs[0]);
-			free(appState.bgs);
+			if (appState.bgs[0]) xfree(appState.bgs[0]);
+			xfree(appState.bgs);
 		}
-		if(appState.favs) free(appState.favs);
+		if(appState.favs) xfree(appState.favs);
+		CloseHandle(hMutex);
 		return 1;
 	}
 	
@@ -685,30 +936,61 @@ int main(int argc, char *argv[]) {
 	if(appState.nsfwIndex < 2){
 		printf("!!!!! NSFW images Loaded, NSFW enabled !!!!!\n");
 		settings.nsfw = 1;
+		saveSettings(efavfpath, &settings);
 	}
 
+	//inventory for tray (exclude bgs[0] launch snapshot from SFW count)
+	g_sfwCount = (appState.nsfwIndex > 1) ? (appState.nsfwIndex - 1) : 0;
+	g_nsfwCount = (appState.numBgs > appState.nsfwIndex) ? (appState.numBgs - appState.nsfwIndex) : 0;
+	printf("Counts SFW:%d NSFW:%d\n", g_sfwCount, g_nsfwCount);
+
 	HWND hwnd = InitializeHiddenWindow();
+	UpdateTrayTip(hwnd);
 
 	UINT timerInterval = approx_minutes * MS_PER_MIN;
 
 	RegisterAppHotkeys();
 
 	UINT_PTR timerId = 0;
+	UINT_PTR holdTimer = 0;
+	int holdDir = HOLD_NONE;
 	if (!settings.loop_pause) {
 		timerId = SetTimer(NULL, TIMER_MAIN, timerInterval, NULL);
 	}
 	MSG msg = {0};
 
 	while(running && GetMessage(&msg, NULL, 0, 0) > 0) {
-		if (msg.message == WM_TIMER && msg.wParam == timerId) {
+		if (msg.message == WM_TIMER && holdTimer && msg.wParam == holdTimer) {
+			//hold-to-cycle: keep going while combo is down, otherwise peaces out
+			int stillHeld = 0;
+			if(holdDir == HOLD_NEXT) stillHeld = isNextHeld();
+			else if(holdDir == HOLD_PREV) stillHeld = isPrevHeld();
+
+			if(stillHeld) {
+				if(holdDir == HOLD_NEXT) {
+					bumpAutoTimer(&timerId, timerInterval);
+					AdvanceBackground(&appState);
+				} else if(holdDir == HOLD_PREV && appState.prevInd >= 0) {
+					bumpAutoTimer(&timerId, timerInterval);
+					PreviousBackground(&appState);
+				}
+				//crank up to the faster repeat rate after the initial delay
+				KillTimer(NULL, holdTimer);
+				holdTimer = SetTimer(NULL, TIMER_HOLD, HOLD_REPEAT_MS, NULL);
+			} else {
+				stopHoldCycle(&holdTimer, &holdDir);
+			}
+		} else if (msg.message == WM_TIMER && timerId && msg.wParam == timerId) {
 			AdvanceBackground(&appState);
 		} else if (msg.message == WM_HOTKEY) {
-			HandleHotkey((int)msg.wParam, &appState, hwnd, efavfpath, &timerId, timerInterval, &running);
+			HandleHotkey((int)msg.wParam, &appState, hwnd, efavfpath, &timerId, timerInterval, &running,
+				&holdTimer, &holdDir);
 		}
 		TranslateMessage(&msg);
 		DispatchMessage(&msg);
 	}
 
+	stopHoldCycle(&holdTimer, &holdDir);
 	if (timerId) KillTimer(NULL, timerId);
 	UnregisterAppHotkeys();
 
@@ -717,10 +999,11 @@ int main(int argc, char *argv[]) {
 	
 	if (appState.bgs) {
 		for (int i = 0; i < appState.numBgs; i++) {
-			if (appState.bgs[i]) free(appState.bgs[i]);
+			if (appState.bgs[i]) xfree(appState.bgs[i]);
 		}
-		free(appState.bgs);
+		xfree(appState.bgs);
 	}
-	if (appState.favs) free(appState.favs);
+	if (appState.favs) xfree(appState.favs);
+	CloseHandle(hMutex);
 	return 0;
 }
