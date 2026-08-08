@@ -679,9 +679,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				if (settings.nsfw == 0) {
 					lstrcpynA(nsfwMenuText, "NSFW Mode: Off\tWin+Shift-X", sizeof(nsfwMenuText));
 				} else if (settings.nsfw == 1) {
-					lstrcpynA(nsfwMenuText, "[-] NSFW Mode: Combined\tWin+Shift-H", sizeof(nsfwMenuText));
+					lstrcpynA(nsfwMenuText, "[-] NSFW Mode: Combined\tWin+Shift-X", sizeof(nsfwMenuText));
 				} else {
-					lstrcpynA(nsfwMenuText, "NSFW Mode: Only NSFW\tWin+Shift-H", sizeof(nsfwMenuText));
+					lstrcpynA(nsfwMenuText, "NSFW Mode: Only NSFW\tWin+Shift-X", sizeof(nsfwMenuText));
 					nsfwState = MF_CHECKED;
 				}
 				AppendMenuA(hMenu, MF_STRING | nsfwState, HK_TOGGLE_NSFW, nsfwMenuText);
