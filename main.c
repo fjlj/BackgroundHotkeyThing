@@ -24,11 +24,13 @@
 #define DEFAULT_NSFW_INDEX 4000
 #define MS_PER_MIN 60000
 //hold next/prev: first extra step after this, then this often (wallpaper set isnt free)
-#define HOLD_INITIAL_MS 400
-#define HOLD_REPEAT_MS 200
+#define HOLD_INITIAL_MS 800
+#define HOLD_REPEAT_MS 400
 #define HOLD_NONE 0
 #define HOLD_NEXT 1
 #define HOLD_PREV 2
+//dont re-pick a wallpaper that showed up in the last N history entries (clamped if pool is tiny)
+#define RECENT_EXCLUDE 10
 
 //flip this on when you want to snoop via DebugView / a debugger
 //#define DEBUG
@@ -44,8 +46,6 @@ typedef enum {
 	HK_QUIT = 1,
 	HK_TOGGLE_ICONS,
 	HK_SAVE_FAV,
-	HK_SAVE_SETTINGS,
-	HK_LOAD_SETTINGS,
 	HK_NEXT_BG,
 	HK_PREV_BG,
 	HK_PAUSE,
@@ -92,7 +92,12 @@ AppSettings settings = {0};
 //folder counts for tray tip / menu (slot 0 is launch snapshot, not counted)
 int g_sfwCount = 0;
 int g_nsfwCount = 0;
-static unsigned int g_rng = 1;
+
+//Middle Square Weyl Sequence state (see seedRng / nextRand)
+//x = running square, w = Weyl accumulator, s = odd Weyl step
+static unsigned long long g_ms_x = 0;
+static unsigned long long g_ms_w = 0;
+static unsigned long long g_ms_s = 0xb5ad4eceda1ce2a9ULL;
 
 //tiny libc-free helpers so we dont drag stdio/stdlib into a wallpaper toy
 void* xmalloc(size_t n) {
@@ -106,14 +111,26 @@ void xfree(void* p) {
 	if(p) HeapFree(GetProcessHeap(), 0, p);
 }
 
-void seedRng(unsigned int s) {
-	g_rng = s ? s : 1;
+//square -> add Weyl -> rotate halves out as the "middle". 31 useful bits.
+//Middle Square Weyl Sequence (Widynski) - von Neumann middle-square + Weyl walk
+//so it doesnt collapse into a sad little cycle. s must stay odd.
+int nextRand(void) {
+	unsigned long long x = g_ms_x;
+	x *= x;
+	x += (g_ms_w += g_ms_s);
+	x = (x >> 32) | (x << 32);
+	g_ms_x = x;
+	return (int)(x & 0x7fffffffULL);
 }
 
-//classic LCG - good enough to pick wallpapers, not for crypto obviously
-int nextRand(void) {
-	g_rng = g_rng * 1103515245u + 12345u;
-	return (int)((g_rng >> 16) & 0x7FFF);
+void seedRng(unsigned int seed) {
+	g_ms_x = 0;
+	g_ms_w = 0;
+	//fold boot entropy into the step constant; golden-ratio-ish mix just for spice
+	g_ms_s = 0xb5ad4eceda1ce2a9ULL ^ ((unsigned long long)seed * 0x9E3779B97F4A7C15ULL);
+	g_ms_s |= 1ULL;
+	//burn a few so we arent living on zeros
+	for(int i = 0; i < 16; i++) nextRand();
 }
 
 //positive ints only (rotation minutes). garbage -> 0
@@ -198,11 +215,65 @@ int hasAllowedExt(const char* fileName) {
 }
 
 //random in [lo, hi] inclusive; busted range just hands back lo
+//rejection sampling so we dont bias low numbers when span doesnt divide 2^31
 int randRange(int lo, int hi) {
 	if(hi < lo) return lo;
 	int span = hi - lo + 1;
 	if(span <= 1) return lo;
-	return lo + (nextRand() % span);
+	//largest multiple of span that fits in 31 bits
+	unsigned int limit = (unsigned int)(0x80000000UL - (0x80000000UL % (unsigned int)span));
+	unsigned int r;
+	do {
+		r = (unsigned int)nextRand();
+	} while(r >= limit);
+	return lo + (int)(r % (unsigned int)span);
+}
+
+//true if bgInd is current or sits in the last `window` history slots
+int wasRecent(AppState* state, int bgInd, int window) {
+	if(bgInd == state->curbg) return 1;
+	if(window <= 0 || state->prevInd < 0) return 0;
+
+	int start = state->prevInd - window + 1;
+	if(start < 0) start = 0;
+	for(int i = start; i <= state->prevInd; i++) {
+		if(state->prev[i] == bgInd) return 1;
+	}
+	return 0;
+}
+
+//random pick in [lo,hi] that isnt in the recent-exclude window.
+//if the folder is smaller than RECENT_EXCLUDE, window shrinks so we always have a way out.
+int pickFreshBg(AppState* state, int lo, int hi) {
+	int span = hi - lo + 1;
+	if(span <= 1) return lo;
+
+	int window = RECENT_EXCLUDE;
+	if(window >= span) window = span - 1;
+	if(window < 0) window = 0;
+
+	//a handful of random shots first (cheap path)
+	for(int attempt = 0; attempt < 48; attempt++) {
+		int c = randRange(lo, hi);
+		if(!wasRecent(state, c, window)) {
+			printf("pickFresh: %d (window=%d)\n", c, window);
+			return c;
+		}
+	}
+
+	//fallback: walk the range from a random start so we dont always bias lo
+	int start = randRange(lo, hi);
+	for(int n = 0; n < span; n++) {
+		int c = lo + ((start - lo + n) % span);
+		if(!wasRecent(state, c, window)) {
+			printf("pickFresh scan: %d (window=%d)\n", c, window);
+			return c;
+		}
+	}
+
+	//everything is "recent" somehow - just roll the dice
+	printf("pickFresh: pool exhausted, allowing repeat\n");
+	return randRange(lo, hi);
 }
 
 //SFW first (ind starts at 1; slot 0 is reserved for launch wallpaper), then NSFW folder
@@ -523,7 +594,7 @@ void AdvanceBackground(AppState* state) {
 		return;
 	}
 
-	int nextBg = randRange(lo, hi);
+	int nextBg = pickFreshBg(state, lo, hi);
 	historyPush(state, nextBg);
 	printf("Setting:[%d]%s\n", state->curbg, state->bgs[state->curbg]);
 	SystemParametersInfo(SPI_SETDESKWALLPAPER, 0, state->bgs[state->curbg], SPIF_SENDCHANGE);
@@ -620,9 +691,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
 				AppendMenuA(hMenu, MF_STRING, HK_SAVE_FAV, "Save Favorite\tWin+Shift-A");
 				AppendMenuA(hMenu, MF_STRING, HK_CLEAR_FAVS, "Clear Favorites\tWin+Shift-C");
-				AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
-				AppendMenuA(hMenu, MF_STRING, HK_SAVE_SETTINGS, "Save Settings\tWin+Alt-S");
-				AppendMenuA(hMenu, MF_STRING, HK_LOAD_SETTINGS, "Load Settings\tWin+Alt-L");
 				AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
 				AppendMenuA(hMenu, MF_STRING, HK_TOGGLE_ICONS, "Toggle Desktop Icons\tWin+Shift-Z");
 				AppendMenuA(hMenu, MF_STRING, HK_OPEN_EXPLORER, "Open in Explorer\tWin+Shift-O");
@@ -732,20 +800,6 @@ void HandleHotkey(int hotkeyId, AppState* appState, HWND hwnd, char* efavfpath,
 			printFavs(appState->favs, appState->bgs);
 			ShowNotification(hwnd, "Favorites", "Saved current background to favorites!", TOAST_DURATION_MS);
 			break;
-		case HK_SAVE_SETTINGS:
-			//manual force-save still handy even though we autosave on change
-			saveSettings(efavfpath, &settings);
-			ShowNotification(hwnd, APP_NAME, "Settings saved", TOAST_DURATION_MS);
-			break;
-		case HK_LOAD_SETTINGS:
-			loadSettings(efavfpath, &settings);
-			if (*timerId) KillTimer(NULL, *timerId);
-			*timerId = 0;
-			if (!settings.loop_pause) {
-				*timerId = SetTimer(NULL, TIMER_MAIN, timerInterval, NULL);
-			}
-			ShowNotification(hwnd, APP_NAME, "Settings reloaded", TOAST_DURATION_MS);
-			break;
 		case HK_NEXT_BG:
 			//tap = one step; hold = keep stepping via TIMER_HOLD + GetAsyncKeyState
 			bumpAutoTimer(timerId, timerInterval);
@@ -817,8 +871,6 @@ void RegisterAppHotkeys() {
 	if(!RegisterHotKey(NULL, HK_QUIT, MOD_WIN | MOD_ALT | MOD_NOREPEAT, 'Q')) lstrcatA(hkErrors, "- Win+Alt-Q (Quit)\n");
 	if(!RegisterHotKey(NULL, HK_TOGGLE_ICONS, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'Z')) lstrcatA(hkErrors, "- Win+Shift-Z (Toggle Icons)\n");
 	if(!RegisterHotKey(NULL, HK_SAVE_FAV, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'A')) lstrcatA(hkErrors, "- Win+Shift-A (Save Fav)\n");
-	if(!RegisterHotKey(NULL, HK_SAVE_SETTINGS, MOD_WIN | MOD_ALT | MOD_NOREPEAT, 'S')) lstrcatA(hkErrors, "- Win+Alt-S (Save Settings)\n");
-	if(!RegisterHotKey(NULL, HK_LOAD_SETTINGS, MOD_WIN | MOD_ALT | MOD_NOREPEAT, 'L')) lstrcatA(hkErrors, "- Win+Alt-L (Load Settings)\n");
 	if(!RegisterHotKey(NULL, HK_NEXT_BG, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'N')) lstrcatA(hkErrors, "- Win+Shift-N (Next BG)\n");
 	if(!RegisterHotKey(NULL, HK_PREV_BG, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'B')) lstrcatA(hkErrors, "- Win+Shift-B (Prev BG)\n");
 	if(!RegisterHotKey(NULL, HK_PAUSE, MOD_WIN | MOD_ALT | MOD_NOREPEAT, 'V')) lstrcatA(hkErrors, "- Win+Alt-V (Pause)\n");

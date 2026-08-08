@@ -37,9 +37,6 @@ Path can be:
 - Win+Shift-L - Only Cycle favorites (will not display NSFW favorites if NSFW mode is off)
 - Win+Shift-C - Clears favorites (memory + ini)
 
-- Win+Alt-S   - Force-save settings (also auto-saves on pause/NSFW/favs-mode/notifications change)
-- Win+Alt-L   - Re-load saved Settings
-
 - Win+Shift-Z - Toggle show/hide desktop icons
 - Win+Alt-N   - Toggle toast notifications
 - Win+Shift-O - Open current background in File Explorer
