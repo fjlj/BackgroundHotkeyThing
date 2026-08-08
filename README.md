@@ -30,17 +30,16 @@ Path can be:
 - Network / UNC (`\\server\share\Wallpapers`)
 
 # Hotkeys
+- Win+Alt-Q   - Quit
+- Win+Alt-N   - Toggle toast notifications
+- Win+Alt-P   - Pause Auto Rotate
 - Win+Shift-N - Set next Background (hold to cycle)
 - Win+Shift-B - Set previous Background (hold to cycle)
-- Win+Alt-V   - Pause Auto Rotate
-- Win+Shift-H - Change NSFW Mode (0/3rd press - Off, 1st press - Combined, 2nd press - Only NSFW)
+- Win+Shift-X - Change NSFW Mode (0/3rd press - Off, 1st press - Combined, 2nd press - Only NSFW)
 - Win+Shift-L - Only Cycle favorites (will not display NSFW favorites if NSFW mode is off)
 - Win+Shift-C - Clears favorites (memory + ini)
-
 - Win+Shift-Z - Toggle show/hide desktop icons
-- Win+Alt-N   - Toggle toast notifications
 - Win+Shift-O - Open current background in File Explorer
 - Win+Shift-A - Save/upsert current background into favorites (bumps to top if already favorited; auto-saves to ini)
-- Win+Alt-Q   - Quit
 
 Favorites + settings live in `BackgroundHotkeyThing.ini` inside the wallpaper folder you pass in.

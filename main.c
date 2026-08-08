@@ -672,12 +672,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
 				AppendMenuA(hMenu, MF_STRING, HK_NEXT_BG, "Next Background\tWin+Shift-N");
 				AppendMenuA(hMenu, MF_STRING, HK_PREV_BG, "Previous Background\tWin+Shift-B");
-				AppendMenuA(hMenu, MF_STRING | (settings.loop_pause ? MF_CHECKED : MF_UNCHECKED), HK_PAUSE, "Toggle Pause\tWin+Alt-V");
+				AppendMenuA(hMenu, MF_STRING | (settings.loop_pause ? MF_CHECKED : MF_UNCHECKED), HK_PAUSE, "Toggle Pause\tWin+Alt-P");
 				
 				char nsfwMenuText[64];
 				UINT nsfwState = MF_UNCHECKED;
 				if (settings.nsfw == 0) {
-					lstrcpynA(nsfwMenuText, "NSFW Mode: Off\tWin+Shift-H", sizeof(nsfwMenuText));
+					lstrcpynA(nsfwMenuText, "NSFW Mode: Off\tWin+Shift-X", sizeof(nsfwMenuText));
 				} else if (settings.nsfw == 1) {
 					lstrcpynA(nsfwMenuText, "[-] NSFW Mode: Combined\tWin+Shift-H", sizeof(nsfwMenuText));
 				} else {
@@ -873,8 +873,8 @@ void RegisterAppHotkeys() {
 	if(!RegisterHotKey(NULL, HK_SAVE_FAV, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'A')) lstrcatA(hkErrors, "- Win+Shift-A (Save Fav)\n");
 	if(!RegisterHotKey(NULL, HK_NEXT_BG, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'N')) lstrcatA(hkErrors, "- Win+Shift-N (Next BG)\n");
 	if(!RegisterHotKey(NULL, HK_PREV_BG, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'B')) lstrcatA(hkErrors, "- Win+Shift-B (Prev BG)\n");
-	if(!RegisterHotKey(NULL, HK_PAUSE, MOD_WIN | MOD_ALT | MOD_NOREPEAT, 'V')) lstrcatA(hkErrors, "- Win+Alt-V (Pause)\n");
-	if(!RegisterHotKey(NULL, HK_TOGGLE_NSFW, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'H')) lstrcatA(hkErrors, "- Win+Shift-H (Toggle NSFW)\n");
+	if(!RegisterHotKey(NULL, HK_PAUSE, MOD_WIN | MOD_ALT | MOD_NOREPEAT, 'P')) lstrcatA(hkErrors, "- Win+Alt-P (Pause)\n");
+	if(!RegisterHotKey(NULL, HK_TOGGLE_NSFW, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'X')) lstrcatA(hkErrors, "- Win+Shift-X (Toggle NSFW)\n");
 	if(!RegisterHotKey(NULL, HK_CYCLE_FAVS, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'L')) lstrcatA(hkErrors, "- Win+Shift-L (Cycle Favs)\n");
 	if(!RegisterHotKey(NULL, HK_CLEAR_FAVS, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'C')) lstrcatA(hkErrors, "- Win+Shift-C (Clear Favs)\n");
 	if(!RegisterHotKey(NULL, HK_OPEN_EXPLORER, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'O')) lstrcatA(hkErrors, "- Win+Shift-O (Open Explorer)\n");
