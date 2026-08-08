@@ -1,45 +1,65 @@
 # BackgroundHotkeyThing
-A small program to scan a folder for png/jpg/jpeg/bmp files and cycle through them as desktop backgrounds.
 
-Also looks for a folder named NSFW within given folder for photos for use only in an NSFW mode.
+Small native Win32 tray app: cycle desktop wallpapers from a folder with global hotkeys, favorites, NSFW modes, and almost no dependencies.
 
-Allow showing/hiding desktop icons with hotkey.
+**Product / releases:** [give.academy/BGHT](http://give.academy/BGHT)
 
-Allow goin back for up to 50 previous backgrounds (in order of display).
+## Source layout
 
-Allow skipping to random next BG.
+| Path | What |
+|------|------|
+| `main.c` | The whole program |
+| `resource.rc` + `BackgroundHotkeyThing.ico` | Tray / window icon |
+| `Makefile` | Portable MinGW build (`gcc` + `windres` on `PATH`) |
+| `scripts/Setup-BackgroundHotkeyThing.ps1` | Validate wallpaper folder, optional `NSFW\`, shortcuts |
 
-Allow pausing/favoriting/saving favorites (favorites + settings auto-save to the ini on change).
+This is a **source-only** repo. Binaries are not checked in — build locally or grab a release from the site.
 
-Single-instance: launching a second copy just tells you it's already running (tray icon).
+## Build
 
-Two cycle modes: Normal(All photos filtered by NSFW mode)/Only Favorites(also filtered by NSFW mode).
+```bash
+mingw32-make
+# -> build/BackgroundHotkeyThing.exe
 
-Three NSFW modes: Off, Combined, Only NSFW folder.
-
-Customize rotation speed (minutes between auto-rotates; which wallpaper comes next is random).
-
-# Usage
+mingw32-make clean
 ```
-BackgroundHotkeyThing.exe <path to BG images> <number of minutes to delay rotation>
+
+## Run
+
+```text
+BackgroundHotkeyThing.exe <path-to-images> [minutes]
 ```
 
-Path can be:
-- Relative (`BGs`, `.\BGs`) — resolved against the **exe folder** (not the shell cwd), so shortcuts keep working
-- Absolute (`C:\Wallpapers`, `D:\Pics\Desktop`)
-- Network / UNC (`\\server\share\Wallpapers`)
+- Images: top-level `png` / `jpg` / `jpeg` / `bmp`, plus optional `NSFW\` subfolder  
+- Path: absolute, UNC, or relative to the **exe** directory  
+- Minutes: auto-rotate interval (default 2 if omitted)
 
-# Hotkeys
-- Win+Alt-Q   - Quit
-- Win+Alt-N   - Toggle toast notifications
-- Win+Alt-P   - Pause Auto Rotate
-- Win+Shift-N - Set next Background (hold to cycle)
-- Win+Shift-B - Set previous Background (hold to cycle)
-- Win+Shift-X - Change NSFW Mode (0/3rd press - Off, 1st press - Combined, 2nd press - Only NSFW)
-- Win+Shift-L - Only Cycle favorites (will not display NSFW favorites if NSFW mode is off)
-- Win+Shift-C - Clears favorites (memory + ini)
-- Win+Shift-Z - Toggle show/hide desktop icons
-- Win+Shift-O - Open current background in File Explorer
-- Win+Shift-A - Save/upsert current background into favorites (bumps to top if already favorited; auto-saves to ini)
+## Setup helper
 
-Favorites + settings live in `BackgroundHotkeyThing.ini` inside the wallpaper folder you pass in.
+**Average user:** double-click `scripts\Setup.bat` and follow the prompts (folder browser, shortcuts, launch).
+
+**Power user:**
+
+```powershell
+.\scripts\Setup-BackgroundHotkeyThing.ps1 -WallpaperPath "D:\Wallpapers" -Minutes 5 -Desktop -Startup
+# fully non-interactive:
+.\scripts\Setup-BackgroundHotkeyThing.ps1 -WallpaperPath "D:\Wallpapers" -Minutes 5 -Desktop -Quiet
+```
+
+Scans for supported images, warns about gotchas, can create `NSFW\` and Desktop/Startup shortcuts.
+
+## Hotkeys
+
+| Combo | Action |
+|-------|--------|
+| Win+Shift-N / B | Next / previous (hold to cycle) |
+| Win+Alt-P | Pause auto-rotate |
+| Win+Shift-X | NSFW Off / Combined / Only |
+| Win+Shift-L | Favorites-only cycle |
+| Win+Shift-A / C | Save / clear favorites |
+| Win+Shift-Z | Toggle desktop icons |
+| Win+Shift-O | Open current image in Explorer |
+| Win+Alt-N | Toast notifications |
+| Win+Alt-Q | Quit |
+
+Settings + favorites auto-save to `BackgroundHotkeyThing.ini` in the wallpaper folder.
