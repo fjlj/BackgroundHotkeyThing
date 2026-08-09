@@ -1,4 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
+#define UNICODE
+#define _UNICODE
 #include <windows.h>
 #include <shellapi.h>
 
@@ -12,12 +14,13 @@
 #define IDI_APP_ICON 101
 #define TOAST_DURATION_MS 1500
 
-#define APP_NAME "BackgroundHotkeyThing"
-#define APP_CLASS "BgHotkeyMsgWindow"
-#define INI_FILENAME "BackgroundHotkeyThing.ini"
-#define INI_SEC_SETTINGS "Settings"
-#define INI_SEC_FAVS "Favs"
-#define MUTEX_NAME "Local\\BackgroundHotkeyThing_SingleInstance"
+#define APP_NAME L"BackgroundHotkeyThing"
+#define APP_NAME_A "BackgroundHotkeyThing"
+#define APP_CLASS L"BgHotkeyMsgWindow"
+#define INI_FILENAME L"BackgroundHotkeyThing.ini"
+#define INI_SEC_SETTINGS L"Settings"
+#define INI_SEC_FAVS L"Favs"
+#define MUTEX_NAME L"Local\\BackgroundHotkeyThing_SingleInstance"
 #define TIMER_MAIN 1
 #define TIMER_TOAST 2
 #define TIMER_HOLD 3
@@ -31,13 +34,16 @@
 #define HOLD_PREV 2
 //dont re-pick a wallpaper that showed up in the last N history entries (clamped if pool is tiny)
 #define RECENT_EXCLUDE 10
+//how deep to walk under the wallpaper root (0 = root only, 4 = root + 4 levels of subfolders)
+#define SCAN_MAX_DEPTH 4
+//wide path buffer (beats classic ANSI MAX_PATH for most real libraries)
+#define PATH_CCH 1024
 
 //flip this on when you want to snoop via DebugView / a debugger
 //#define DEBUG
 
 #ifdef DEBUG
-	//wsprintfA + OutputDebugString - no stdio tax, still a real printf-shaped thing
-	#define printf(...) do { char _dbg[1024]; wsprintfA(_dbg, __VA_ARGS__); OutputDebugStringA(_dbg); } while(0)
+	#define printf(...) do { wchar_t _dbg[1024]; wsprintfW(_dbg, __VA_ARGS__); OutputDebugStringW(_dbg); } while(0)
 #else
 	#define printf(...) 
 #endif
@@ -78,8 +84,9 @@ typedef struct intStack {
 } intStack;
 
 typedef struct {
-	char** bgs;
+	wchar_t** bgs;
 	int numBgs;
+	//partition: [0]=launch snapshot, [1..nsfwIndex)=SFW, [nsfwIndex..numBgs)=NSFW
 	int nsfwIndex;
 	int curbg;
 	//prev[] = advances only. prevInd==-1 is "home" (launch wallpaper, bgs[0])
@@ -88,18 +95,21 @@ typedef struct {
 	intStack* favs;
 } AppState;
 
+//growing list of wide paths (used while scanning, then folded into AppState.bgs)
+typedef struct {
+	wchar_t** paths;
+	int count;
+	int capacity;
+} PathList;
+
 AppSettings settings = {0};
-//folder counts for tray tip / menu (slot 0 is launch snapshot, not counted)
 int g_sfwCount = 0;
 int g_nsfwCount = 0;
 
-//Middle Square Weyl Sequence state (see seedRng / nextRand)
-//x = running square, w = Weyl accumulator, s = odd Weyl step
 static unsigned long long g_ms_x = 0;
 static unsigned long long g_ms_w = 0;
 static unsigned long long g_ms_s = 0xb5ad4eceda1ce2a9ULL;
 
-//tiny libc-free helpers so we dont drag stdio/stdlib into a wallpaper toy
 void* xmalloc(size_t n) {
 	return HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, n);
 }
@@ -111,9 +121,6 @@ void xfree(void* p) {
 	if(p) HeapFree(GetProcessHeap(), 0, p);
 }
 
-//square -> add Weyl -> rotate halves out as the "middle". 31 useful bits.
-//Middle Square Weyl Sequence (Widynski) - von Neumann middle-square + Weyl walk
-//so it doesnt collapse into a sad little cycle. s must stay odd.
 int nextRand(void) {
 	unsigned long long x = g_ms_x;
 	x *= x;
@@ -126,101 +133,242 @@ int nextRand(void) {
 void seedRng(unsigned int seed) {
 	g_ms_x = 0;
 	g_ms_w = 0;
-	//fold boot entropy into the step constant; golden-ratio-ish mix just for spice
 	g_ms_s = 0xb5ad4eceda1ce2a9ULL ^ ((unsigned long long)seed * 0x9E3779B97F4A7C15ULL);
 	g_ms_s |= 1ULL;
-	//burn a few so we arent living on zeros
 	for(int i = 0; i < 16; i++) nextRand();
 }
 
-//positive ints only (rotation minutes). garbage -> 0
-int parsePositiveInt(const char* s) {
+int parsePositiveIntW(const wchar_t* s) {
 	int n = 0;
 	if(!s || !*s) return 0;
 	for(; *s; s++) {
-		if(*s < '0' || *s > '9') return 0;
-		n = n * 10 + (*s - '0');
+		if(*s < L'0' || *s > L'9') return 0;
+		n = n * 10 + (int)(*s - L'0');
 	}
 	return n;
 }
 
-char* lastPathSep(char* s) {
-	char* p = NULL;
+int wlen(const wchar_t* s) {
+	int n = 0;
+	if(!s) return 0;
+	while(s[n]) n++;
+	return n;
+}
+
+void wcpy(wchar_t* dst, const wchar_t* src, int cch) {
+	if(!dst || cch < 1) return;
+	if(!src) { dst[0] = 0; return; }
+	int i = 0;
+	for(; i < cch - 1 && src[i]; i++) dst[i] = src[i];
+	dst[i] = 0;
+}
+
+//case-insensitive wide compare (Win32, no CRT)
+int wicmp(const wchar_t* a, const wchar_t* b) {
+	return CompareStringW(LOCALE_USER_DEFAULT, NORM_IGNORECASE, a, -1, b, -1) - CSTR_EQUAL;
+}
+
+int wnicmp(const wchar_t* a, const wchar_t* b, int n) {
+	return CompareStringW(LOCALE_USER_DEFAULT, NORM_IGNORECASE, a, n, b, n) - CSTR_EQUAL;
+}
+
+wchar_t* lastPathSepW(wchar_t* s) {
+	wchar_t* p = NULL;
 	for(; *s; s++) {
-		if(*s == '\\' || *s == '/') p = s;
+		if(*s == L'\\' || *s == L'/') p = s;
 	}
 	return p;
 }
 
-const char* lastDot(const char* s) {
-	const char* p = NULL;
+const wchar_t* lastDotW(const wchar_t* s) {
+	const wchar_t* p = NULL;
 	for(; *s; s++) {
-		if(*s == '.') p = s;
+		if(*s == L'.') p = s;
 	}
 	return p;
 }
 
-//drive / UNC / \\?\ / root-relative = absolute. BGs / .\BGs / ..\x = relative
-int isAbsoluteWinPath(const char* p) {
-	if(!p || !p[0]) return 0;
-	if(p[0] == '\\' && p[1] == '\\') return 1;
-	if(p[0] == '\\' || p[0] == '/') return 1;
-	if(((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':') {
-		if(p[2] == '\0' || p[2] == '\\' || p[2] == '/') return 1;
+//true if any path *segment* is "NSFW" (case-insensitive): \NSFW\, \NSFW, NSFW\...
+int pathHasNsfwSegment(const wchar_t* path) {
+	if(!path || !path[0]) return 0;
+	const wchar_t* p = path;
+	while(*p) {
+		while(*p == L'\\' || *p == L'/') p++;
+		if(!*p) break;
+		const wchar_t* start = p;
+		while(*p && *p != L'\\' && *p != L'/') p++;
+		int len = (int)(p - start);
+		if(len == 4 && wnicmp(start, L"NSFW", 4) == 0) return 1;
 	}
 	return 0;
 }
 
-//absolute/UNC stay rooted; relative hangs off the *exe* dir (not cwd - shortcuts thank us)
-int resolveBgPath(const char* input, char* out, DWORD outSize) {
-	char combined[MAX_PATH] = {0};
+int isAbsoluteWinPathW(const wchar_t* p) {
+	if(!p || !p[0]) return 0;
+	if(p[0] == L'\\' && p[1] == L'\\') return 1;
+	if(p[0] == L'\\' || p[0] == L'/') return 1;
+	if(((p[0] >= L'A' && p[0] <= L'Z') || (p[0] >= L'a' && p[0] <= L'z')) && p[1] == L':') {
+		if(p[2] == 0 || p[2] == L'\\' || p[2] == L'/') return 1;
+	}
+	return 0;
+}
 
-	if(!input || !input[0] || !out || outSize < 2) return 0;
+//absolute/UNC stay rooted; relative hangs off the *exe* dir (not cwd)
+int resolveBgPathW(const wchar_t* input, wchar_t* out, DWORD cchOut) {
+	wchar_t combined[PATH_CCH] = {0};
 
-	if(isAbsoluteWinPath(input)) {
-		DWORD n = GetFullPathNameA(input, outSize, out, NULL);
-		if(n == 0 || n >= outSize) {
-			lstrcpynA(out, input, (int)outSize);
-		}
+	if(!input || !input[0] || !out || cchOut < 2) return 0;
+
+	if(isAbsoluteWinPathW(input)) {
+		DWORD n = GetFullPathNameW(input, cchOut, out, NULL);
+		if(n == 0 || n >= cchOut) wcpy(out, input, (int)cchOut);
 		return 1;
 	}
 
-	char exePath[MAX_PATH] = {0};
-	if(!GetModuleFileNameA(NULL, exePath, MAX_PATH)) return 0;
-	char* slash = lastPathSep(exePath);
-	if(slash) *slash = '\0';
+	wchar_t exePath[PATH_CCH] = {0};
+	if(!GetModuleFileNameW(NULL, exePath, PATH_CCH)) return 0;
+	wchar_t* slash = lastPathSepW(exePath);
+	if(slash) *slash = 0;
 	else {
-		lstrcpynA(out, input, (int)outSize);
+		wcpy(out, input, (int)cchOut);
 		return 1;
 	}
 
-	wsprintfA(combined, "%s\\%s", exePath, input);
-	DWORD n = GetFullPathNameA(combined, outSize, out, NULL);
-	if(n == 0 || n >= outSize) {
-		lstrcpynA(out, combined, (int)outSize);
-	}
-	printf("Resolved relative path:\n  in : %s\n  out: %s\n", input, out);
+	wsprintfW(combined, L"%s\\%s", exePath, input);
+	DWORD n = GetFullPathNameW(combined, cchOut, out, NULL);
+	if(n == 0 || n >= cchOut) wcpy(out, combined, (int)cchOut);
+	printf(L"Resolved relative path:\n  in : %s\n  out: %s\n", input, out);
 	return 1;
 }
 
-//png/jpg/jpeg/bmp, case-insensitive. no extension = kick rocks
-int hasAllowedExt(const char* fileName) {
-	const char* dot = lastDot(fileName);
+int hasAllowedExtW(const wchar_t* fileName) {
+	const wchar_t* dot = lastDotW(fileName);
 	if(!dot || !dot[1]) return 0;
-	if(lstrcmpiA(dot, ".png") == 0) return 1;
-	if(lstrcmpiA(dot, ".jpg") == 0) return 1;
-	if(lstrcmpiA(dot, ".jpeg") == 0) return 1;
-	if(lstrcmpiA(dot, ".bmp") == 0) return 1;
+	if(wicmp(dot, L".png") == 0) return 1;
+	if(wicmp(dot, L".jpg") == 0) return 1;
+	if(wicmp(dot, L".jpeg") == 0) return 1;
+	if(wicmp(dot, L".bmp") == 0) return 1;
 	return 0;
 }
 
-//random in [lo, hi] inclusive; busted range just hands back lo
-//rejection sampling so we dont bias low numbers when span doesnt divide 2^31
+int pathListInit(PathList* list, int cap) {
+	list->count = 0;
+	list->capacity = cap > 0 ? cap : 64;
+	list->paths = xmalloc((size_t)list->capacity * sizeof(wchar_t*));
+	return list->paths != NULL;
+}
+
+int pathListAdd(PathList* list, const wchar_t* path) {
+	if(list->count >= list->capacity) {
+		int nc = list->capacity * 2;
+		wchar_t** np = xrealloc(list->paths, (size_t)nc * sizeof(wchar_t*));
+		if(!np) return 0;
+		list->paths = np;
+		list->capacity = nc;
+	}
+	int n = wlen(path) + 1;
+	list->paths[list->count] = xmalloc((size_t)n * sizeof(wchar_t));
+	if(!list->paths[list->count]) return 0;
+	wcpy(list->paths[list->count], path, n);
+	list->count++;
+	return 1;
+}
+
+void pathListFree(PathList* list) {
+	if(!list || !list->paths) return;
+	for(int i = 0; i < list->count; i++) xfree(list->paths[i]);
+	xfree(list->paths);
+	list->paths = NULL;
+	list->count = 0;
+	list->capacity = 0;
+}
+
+//recursive folder walk. depth 0 = wallpaper root. NSFW = any path segment "NSFW".
+void scanDirW(const wchar_t* dir, int depth, PathList* sfw, PathList* nsfw) {
+	wchar_t pattern[PATH_CCH];
+	wchar_t full[PATH_CCH];
+	WIN32_FIND_DATAW fd;
+	HANDLE hFind;
+
+	wsprintfW(pattern, L"%s\\*", dir);
+	hFind = FindFirstFileW(pattern, &fd);
+	if(hFind == INVALID_HANDLE_VALUE) return;
+
+	do {
+		if(wicmp(fd.cFileName, L".") == 0 || wicmp(fd.cFileName, L"..") == 0) continue;
+
+		//join carefully
+		int dlen = wlen(dir);
+		int flen = wlen(fd.cFileName);
+		if(dlen + 1 + flen + 1 > PATH_CCH) continue;
+		wcpy(full, dir, PATH_CCH);
+		full[dlen] = L'\\';
+		wcpy(full + dlen + 1, fd.cFileName, PATH_CCH - dlen - 1);
+
+		if(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+			//optional: skip reparse points so we dont wander into junctions forever
+			if(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+			if(depth < SCAN_MAX_DEPTH) {
+				scanDirW(full, depth + 1, sfw, nsfw);
+			}
+		} else if(hasAllowedExtW(fd.cFileName)) {
+			if(pathHasNsfwSegment(full)) {
+				pathListAdd(nsfw, full);
+				printf(L"NSFW: %s\n", full);
+			} else {
+				pathListAdd(sfw, full);
+				printf(L"SFW : %s\n", full);
+			}
+		}
+	} while(FindNextFileW(hFind, &fd));
+
+	FindClose(hFind);
+}
+
+//fills bgs[]: [0] reserved by caller, then all SFW, then all NSFW. sets *nsfwInd.
+int ListDirectoryContentsW(const wchar_t* sDir, wchar_t*** bgs_ptr, int* capacity, int* nsfwInd) {
+	PathList sfw = {0}, nsfw = {0};
+	if(!pathListInit(&sfw, 256) || !pathListInit(&nsfw, 64)) {
+		pathListFree(&sfw);
+		pathListFree(&nsfw);
+		return 1;
+	}
+
+	scanDirW(sDir, 0, &sfw, &nsfw);
+
+	int need = 1 + sfw.count + nsfw.count;
+	if(need > *capacity) {
+		wchar_t** nb = xrealloc(*bgs_ptr, (size_t)need * sizeof(wchar_t*));
+		if(!nb) {
+			pathListFree(&sfw);
+			pathListFree(&nsfw);
+			return 1;
+		}
+		*bgs_ptr = nb;
+		*capacity = need;
+	}
+
+	int ind = 1;
+	for(int i = 0; i < sfw.count; i++) {
+		(*bgs_ptr)[ind++] = sfw.paths[i];
+		sfw.paths[i] = NULL; //ownership moved
+	}
+	*nsfwInd = ind;
+	for(int i = 0; i < nsfw.count; i++) {
+		(*bgs_ptr)[ind++] = nsfw.paths[i];
+		nsfw.paths[i] = NULL;
+	}
+
+	//free list shells (paths stolen)
+	xfree(sfw.paths);
+	xfree(nsfw.paths);
+	return ind;
+}
+
 int randRange(int lo, int hi) {
 	if(hi < lo) return lo;
 	int span = hi - lo + 1;
 	if(span <= 1) return lo;
-	//largest multiple of span that fits in 31 bits
 	unsigned int limit = (unsigned int)(0x80000000UL - (0x80000000UL % (unsigned int)span));
 	unsigned int r;
 	do {
@@ -229,11 +377,9 @@ int randRange(int lo, int hi) {
 	return lo + (int)(r % (unsigned int)span);
 }
 
-//true if bgInd is current or sits in the last `window` history slots
 int wasRecent(AppState* state, int bgInd, int window) {
 	if(bgInd == state->curbg) return 1;
 	if(window <= 0 || state->prevInd < 0) return 0;
-
 	int start = state->prevInd - window + 1;
 	if(start < 0) start = 0;
 	for(int i = start; i <= state->prevInd; i++) {
@@ -242,8 +388,6 @@ int wasRecent(AppState* state, int bgInd, int window) {
 	return 0;
 }
 
-//random pick in [lo,hi] that isnt in the recent-exclude window.
-//if the folder is smaller than RECENT_EXCLUDE, window shrinks so we always have a way out.
 int pickFreshBg(AppState* state, int lo, int hi) {
 	int span = hi - lo + 1;
 	if(span <= 1) return lo;
@@ -252,114 +396,36 @@ int pickFreshBg(AppState* state, int lo, int hi) {
 	if(window >= span) window = span - 1;
 	if(window < 0) window = 0;
 
-	//a handful of random shots first (cheap path)
 	for(int attempt = 0; attempt < 48; attempt++) {
 		int c = randRange(lo, hi);
 		if(!wasRecent(state, c, window)) {
-			printf("pickFresh: %d (window=%d)\n", c, window);
+			printf(L"pickFresh: %d (window=%d)\n", c, window);
 			return c;
 		}
 	}
 
-	//fallback: walk the range from a random start so we dont always bias lo
 	int start = randRange(lo, hi);
 	for(int n = 0; n < span; n++) {
 		int c = lo + ((start - lo + n) % span);
 		if(!wasRecent(state, c, window)) {
-			printf("pickFresh scan: %d (window=%d)\n", c, window);
+			printf(L"pickFresh scan: %d (window=%d)\n", c, window);
 			return c;
 		}
 	}
 
-	//everything is "recent" somehow - just roll the dice
-	printf("pickFresh: pool exhausted, allowing repeat\n");
+	printf(L"pickFresh: pool exhausted, allowing repeat\n");
 	return randRange(lo, hi);
 }
 
-//SFW first (ind starts at 1; slot 0 is reserved for launch wallpaper), then NSFW folder
-int ListDirectoryContents(const char *sDir, char*** bgs_ptr, int* capacity, int *nsfwInd) {
-	WIN32_FIND_DATA fdFile;
-	HANDLE hFind = NULL;
-	char sPath[MAX_PATH] = {0};
-	char NSFWpath[MAX_PATH] = {0};
-
-	int ind = 1;
-	//*.* = everything, we filter extensions ourselves
-	wsprintfA(sPath, "%s\\*.*", sDir);
-	wsprintfA(NSFWpath, "%s\\NSFW\\*.*", sDir);
-
-	if((hFind = FindFirstFile(sPath, &fdFile)) == INVALID_HANDLE_VALUE) {
-		return ind;
-	}
-
-	do {
-		if(!(fdFile.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && 
-		   lstrcmpA(fdFile.cFileName, ".") != 0  && 
-		   lstrcmpA(fdFile.cFileName, "..") != 0 && 
-		   hasAllowedExt(fdFile.cFileName)) {
-		   	
-			if (ind >= *capacity) {
-				size_t new_capacity = *capacity * 2;
-				char** new_bgs = xrealloc(*bgs_ptr, new_capacity * sizeof(char*));
-				if (!new_bgs) return ind;
-				*capacity = (int)new_capacity;
-				*bgs_ptr = new_bgs;
-			}
-
-			wsprintfA(sPath, "%s\\%s", sDir, fdFile.cFileName);
-			size_t slen = (size_t)lstrlenA(sPath)+1;
-			(*bgs_ptr)[ind] = xmalloc(slen);
-			CopyMemory((*bgs_ptr)[ind], sPath, slen);
-			printf("File: %d:%s\n", ind, (*bgs_ptr)[ind]);
-			ind++;
-		}
-	} while(FindNextFile(hFind, &fdFile));
-
-	FindClose(hFind); //Always, Always, clean things up!
-	*nsfwInd = ind;
-	
-	if((hFind = FindFirstFile(NSFWpath, &fdFile)) == INVALID_HANDLE_VALUE) {
-		return ind;
-	}
-
-	do {
-		if(!(fdFile.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
-		   lstrcmpA(fdFile.cFileName, ".") != 0 && 
-		   lstrcmpA(fdFile.cFileName, "..") != 0 && 
-		   hasAllowedExt(fdFile.cFileName)) {
-		   	
-			if (ind >= *capacity) {
-				size_t new_capacity = *capacity * 2;
-				char** new_bgs = xrealloc(*bgs_ptr, new_capacity * sizeof(char*));
-				if (!new_bgs) return ind;
-				*capacity = (int)new_capacity;
-				*bgs_ptr = new_bgs;
-			}
-
-			wsprintfA(NSFWpath, "%s\\NSFW\\%s", sDir, fdFile.cFileName);
-			size_t slen = (size_t)lstrlenA(NSFWpath)+1;
-			(*bgs_ptr)[ind] = xmalloc(slen);
-			CopyMemory((*bgs_ptr)[ind], NSFWpath, slen);
-			printf("File: %d:%s\n", ind, (*bgs_ptr)[ind]);
-			ind++;
-		}
-	} while(FindNextFile(hFind, &fdFile));
-
-	FindClose(hFind); //Always, Always, clean things up!
-
-	return ind;
-}
-
-//desktop listview host - Progman first, then WorkerW scavenger hunt (icon hide/show)
-HWND gethShellViewWin() {
-	HWND prgMan = FindWindowA("Progman", "Program Manager");
-	HWND hShellViewWin = FindWindowExA(prgMan, 0, "SHELLDLL_DefView", "");
+HWND gethShellViewWin(void) {
+	HWND prgMan = FindWindowW(L"Progman", L"Program Manager");
+	HWND hShellViewWin = FindWindowExW(prgMan, 0, L"SHELLDLL_DefView", L"");
 
 	if(hShellViewWin == 0x00) {
 		HWND hWorkerW = 0x00;
 		do {
-			hWorkerW = FindWindowExA(0, hWorkerW, "WorkerW", "");
-			hShellViewWin = FindWindowExA(hWorkerW, 0, "SHELLDLL_DefView", "");
+			hWorkerW = FindWindowExW(0, hWorkerW, L"WorkerW", L"");
+			hShellViewWin = FindWindowExW(hWorkerW, 0, L"SHELLDLL_DefView", L"");
 		} while (hShellViewWin == 0x00 && hWorkerW != 0x00);
 	}
 	return hShellViewWin;
@@ -372,7 +438,6 @@ int findInIntStack(intStack* stack, int data) {
 	return -1;
 }
 
-//yank one slot and close the gap (upsert helper)
 void removeIntStackAt(intStack* stack, int idx) {
 	if(idx < 0 || idx > stack->top) return;
 	if(idx < stack->top) {
@@ -384,10 +449,7 @@ void removeIntStackAt(intStack* stack, int idx) {
 	stack->pointer = stack->top;
 }
 
-//push to top; if full, shift down (drop oldest) and write top
-//also returns the data written... (not really needed but eh why not)
 int pushIntStack(intStack* stack, int data){
-	
 	stack->top++;
 	if(stack->top >= MAX_iSTACK_SIZE){
 		stack->top = MAX_iSTACK_SIZE - 1;
@@ -396,23 +458,20 @@ int pushIntStack(intStack* stack, int data){
 		stack->pointer = stack->top;
 		return data;
 	}
-	
 	stack->inds[stack->top] = data;
 	stack->pointer = stack->top;
 	return data;
 }
 
-//already in list? pull it out and re-push to top. full + brand new? FIFO drop oldest.
 int upsertIntStack(intStack* stack, int data) {
 	int existing = findInIntStack(stack, data);
 	if(existing >= 0) {
 		removeIntStackAt(stack, existing);
-		printf("fav upsert: moved existing slot %d to top\n", existing);
+		printf(L"fav upsert: moved existing slot %d to top\n", existing);
 	}
 	return pushIntStack(stack, data);
 }
 
-//walk favorites newest->oldest; wrap. returns current then steps pointer down 1
 int peekIntStackItr(intStack* stack){
 	if(stack->top <= -1) { stack->top = -1; return 0; }
 	int data = stack->inds[stack->pointer];
@@ -421,76 +480,59 @@ int peekIntStackItr(intStack* stack){
 	return data;
 }
 
-void printFavs(intStack* favs,char **bgs){
-	printf("------Current Favorites------\n");
+void printFavs(intStack* favs, wchar_t** bgs){
+	printf(L"------Current Favorites------\n");
 	for(int i = 0; i <= favs->top; i++){
-		printf("fav[%d]:%d = %s\n",i,favs->inds[i],bgs[favs->inds[i]]);
+		printf(L"fav[%d]:%d = %s\n", i, favs->inds[i], bgs[favs->inds[i]]);
 	}
 }
 
-//wipe [Favs] then rewrite so we dont leave ghost Fav-N slots behind
-void saveFavs(char* efavfpath,intStack* favs, char **bgs){
-	WritePrivateProfileStringA(INI_SEC_FAVS, NULL, NULL, efavfpath);
+void saveFavs(const wchar_t* efavfpath, intStack* favs, wchar_t** bgs){
+	WritePrivateProfileStringW(INI_SEC_FAVS, NULL, NULL, efavfpath);
 	if(favs->top < 0) return;
 
-	char slotName[16] = {0};
+	wchar_t slotName[16] = {0};
 	for(int i = 0; i <= favs->top; i++){
-		wsprintfA(slotName,"Fav-%d",i);
-		WritePrivateProfileStringA(
-			INI_SEC_FAVS,
-			slotName,
-			bgs[favs->inds[i]],
-			efavfpath);
-	}  
+		wsprintfW(slotName, L"Fav-%d", i);
+		WritePrivateProfileStringW(INI_SEC_FAVS, slotName, bgs[favs->inds[i]], efavfpath);
+	}
 }
 
-void saveSettings(char* efavfpath, AppSettings* s) {
-	char ival[8] = {0};
-	wsprintfA(ival, "%d", s->onlyFavs);
-	WritePrivateProfileStringA(INI_SEC_SETTINGS, "Set-0", ival, efavfpath);
-	wsprintfA(ival, "%d", s->nsfw);
-	WritePrivateProfileStringA(INI_SEC_SETTINGS, "Set-1", ival, efavfpath);
-	wsprintfA(ival, "%d", s->loop_pause);
-	WritePrivateProfileStringA(INI_SEC_SETTINGS, "Set-2", ival, efavfpath);
-	wsprintfA(ival, "%d", s->notifications);
-	WritePrivateProfileStringA(INI_SEC_SETTINGS, "Set-3", ival, efavfpath);
+void saveSettings(const wchar_t* efavfpath, AppSettings* s) {
+	wchar_t ival[8] = {0};
+	wsprintfW(ival, L"%d", s->onlyFavs);
+	WritePrivateProfileStringW(INI_SEC_SETTINGS, L"Set-0", ival, efavfpath);
+	wsprintfW(ival, L"%d", s->nsfw);
+	WritePrivateProfileStringW(INI_SEC_SETTINGS, L"Set-1", ival, efavfpath);
+	wsprintfW(ival, L"%d", s->loop_pause);
+	WritePrivateProfileStringW(INI_SEC_SETTINGS, L"Set-2", ival, efavfpath);
+	wsprintfW(ival, L"%d", s->notifications);
+	WritePrivateProfileStringW(INI_SEC_SETTINGS, L"Set-3", ival, efavfpath);
 }
 
-void loadSettings(char* efavfpath, AppSettings* s) {
-	s->onlyFavs = GetPrivateProfileIntA(INI_SEC_SETTINGS, "Set-0", s->onlyFavs, efavfpath);
-	s->nsfw = GetPrivateProfileIntA(INI_SEC_SETTINGS, "Set-1", s->nsfw, efavfpath);
-	s->loop_pause = GetPrivateProfileIntA(INI_SEC_SETTINGS, "Set-2", s->loop_pause, efavfpath);
-	s->notifications = GetPrivateProfileIntA(INI_SEC_SETTINGS, "Set-3", s->notifications, efavfpath);
+void loadSettings(const wchar_t* efavfpath, AppSettings* s) {
+	s->onlyFavs = GetPrivateProfileIntW(INI_SEC_SETTINGS, L"Set-0", s->onlyFavs, efavfpath);
+	s->nsfw = GetPrivateProfileIntW(INI_SEC_SETTINGS, L"Set-1", s->nsfw, efavfpath);
+	s->loop_pause = GetPrivateProfileIntW(INI_SEC_SETTINGS, L"Set-2", s->loop_pause, efavfpath);
+	s->notifications = GetPrivateProfileIntW(INI_SEC_SETTINGS, L"Set-3", s->notifications, efavfpath);
 }
 
-void importFavs(char* efavfpath, intStack* favs,char* bgs[],int numBgs){
-	char favPath[MAX_PATH] = {0x00};
-	char slotName[16] = {0};
+void importFavs(const wchar_t* efavfpath, intStack* favs, wchar_t** bgs, int numBgs){
+	wchar_t favPath[PATH_CCH] = {0};
+	wchar_t slotName[16] = {0};
 	for(int i = 0; i < MAX_iSTACK_SIZE; i++){
-		
-		wsprintfA(slotName,"Fav-%d",i);
-		
-		if(!GetPrivateProfileStringA(
-	  		INI_SEC_FAVS,
-		    slotName,
-		    "",
-		    favPath,
-		    MAX_PATH,
-		    efavfpath)
-		) break;
-	    
-	    for(int o = 0; o < numBgs; o++){
-			if(lstrcmpA(bgs[o], favPath) == 0){
-				//import oldest->newest with plain push (upsert would reshuffle on load)
-				pushIntStack(favs,o);
+		wsprintfW(slotName, L"Fav-%d", i);
+		if(!GetPrivateProfileStringW(INI_SEC_FAVS, slotName, L"", favPath, PATH_CCH, efavfpath))
+			break;
+		for(int o = 0; o < numBgs; o++){
+			if(wicmp(bgs[o], favPath) == 0){
+				pushIntStack(favs, o);
 				break;
 			}
-		} 	
-	}	    
+		}
+	}
 }
 
-//home lives outside the ring (prevInd==-1 / bgs[0]). prev[] is advances only -
-//filling the ring never steals your way back to the launch wallpaper.
 void historyPush(AppState* state, int bgInd) {
 	if(state->prevInd < 0) {
 		state->prevInd = 0;
@@ -505,8 +547,10 @@ void historyPush(AppState* state, int bgInd) {
 	state->curbg = bgInd;
 }
 
-//nsfw partition starts at nsfwIndex. when nsfw mode is off, walk the whole fav
-//ring once and skip NSFW slots instead of stalling on the first one forever.
+void setWallpaper(const wchar_t* path) {
+	SystemParametersInfoW(SPI_SETDESKWALLPAPER, 0, (PVOID)path, SPIF_SENDCHANGE);
+}
+
 int nextFav(AppState* state) {
 	if(state->favs->top < 0) return -1;
 
@@ -516,44 +560,43 @@ int nextFav(AppState* state) {
 		int favSlot = peekIntStackItr(state->favs);
 
 		if(favSlot < state->nsfwIndex || settings.nsfw > 0) {
-			printf("load fav[%d] = %d - bg: %s\n", favsp, favSlot, state->bgs[favSlot]);
-			SystemParametersInfo(SPI_SETDESKWALLPAPER, 0, state->bgs[favSlot], SPIF_SENDCHANGE);
+			printf(L"load fav[%d] = %d - bg: %s\n", favsp, favSlot, state->bgs[favSlot]);
+			setWallpaper(state->bgs[favSlot]);
 			return favSlot;
 		}
-		printf("skip NSFW fav[%d]=%d (nsfw mode off)\n", favsp, favSlot);
+		printf(L"skip NSFW fav[%d]=%d (nsfw mode off)\n", favsp, favSlot);
 	}
 
-	printf("No loadable favorites for current NSFW mode\n");
+	printf(L"No loadable favorites for current NSFW mode\n");
 	return -1;
 }
 
-int initBGs(char* relpath, AppState* appState, char* orgPaper){
-	//snapshot their current desktop - bgs[0], start at home (prevInd=-1)
-	SystemParametersInfo(SPI_GETDESKWALLPAPER,MAX_PATH,orgPaper,0);
-	
+int initBGs(const wchar_t* relpath, AppState* appState, wchar_t* orgPaper, int orgCch){
+	SystemParametersInfoW(SPI_GETDESKWALLPAPER, (UINT)orgCch, orgPaper, 0);
+
 	int capacity = 1000;
-	appState->bgs = xmalloc(capacity * sizeof(char*));
+	appState->bgs = xmalloc((size_t)capacity * sizeof(wchar_t*));
 	if (!appState->bgs) return 0;
 
-	size_t ogPathLen = (size_t)lstrlenA(orgPaper)+1;
-	appState->bgs[0] = xmalloc(ogPathLen);
-	CopyMemory(appState->bgs[0], orgPaper, ogPathLen);
+	int ogLen = wlen(orgPaper) + 1;
+	appState->bgs[0] = xmalloc((size_t)ogLen * sizeof(wchar_t));
+	wcpy(appState->bgs[0], orgPaper, ogLen);
 
 	appState->prevInd = -1;
 	appState->curbg = 0;
 
-	int numBgs = ListDirectoryContents(relpath, &(appState->bgs), &capacity, &(appState->nsfwIndex));
+	int numBgs = ListDirectoryContentsW(relpath, &(appState->bgs), &capacity, &(appState->nsfwIndex));
 
-	printf("%d Backgrounds Loaded.\nNSFW Begins at:%d\n",numBgs,appState->nsfwIndex);
+	printf(L"%d Backgrounds Loaded.\nNSFW Begins at:%d\n", numBgs, appState->nsfwIndex);
 
-	//numBgs==1 means we only have the launch snapshot, no folder images
 	if(numBgs <= 1) {
-		char errmsg[MAX_PATH+32];
-		wsprintfA(errmsg,"Path or Images not found at: [%s]\n",relpath);
-		MessageBoxA(0,errmsg,"Whoops!", 0);
+		wchar_t errmsg[PATH_CCH + 64];
+		wsprintfW(errmsg, L"Path or Images not found at:\n[%s]\n\n(png/jpg/jpeg/bmp, nested up to depth %d)",
+			relpath, SCAN_MAX_DEPTH);
+		MessageBoxW(0, errmsg, L"Whoops!", MB_OK | MB_ICONWARNING);
 		return 0;
 	}
-	
+
 	return numBgs;
 }
 
@@ -577,42 +620,39 @@ void AdvanceBackground(AppState* state) {
 	int hi = state->numBgs - 1;
 
 	if(!settings.nsfw) {
-		//SFW only (skip index 0 = launch snapshot)
 		lo = 1;
 		hi = state->nsfwIndex - 1;
 	} else if(settings.nsfw == 2) {
 		lo = state->nsfwIndex;
 		hi = state->numBgs - 1;
 	} else {
-		//combined: everything loaded except the launch snapshot
 		lo = 1;
 		hi = state->numBgs - 1;
 	}
 
 	if(hi < lo) {
-		printf("No backgrounds available for current NSFW mode (lo=%d hi=%d)\n", lo, hi);
+		printf(L"No backgrounds available for current NSFW mode (lo=%d hi=%d)\n", lo, hi);
 		return;
 	}
 
 	int nextBg = pickFreshBg(state, lo, hi);
 	historyPush(state, nextBg);
-	printf("Setting:[%d]%s\n", state->curbg, state->bgs[state->curbg]);
-	SystemParametersInfo(SPI_SETDESKWALLPAPER, 0, state->bgs[state->curbg], SPIF_SENDCHANGE);
+	printf(L"Setting:[%d]%s\n", state->curbg, state->bgs[state->curbg]);
+	setWallpaper(state->bgs[state->curbg]);
 }
 
 void PreviousBackground(AppState* state) {
-	if(state->prevInd < 0) return; //already home
+	if(state->prevInd < 0) return;
 
 	if(state->prevInd == 0) {
-		//step off oldest advance -> always restore launch wallpaper
 		state->prevInd = -1;
 		state->curbg = 0;
 	} else {
 		state->prevInd--;
 		state->curbg = state->prev[state->prevInd];
 	}
-	printf("Setting:[%d]%s\n", state->curbg, state->bgs[state->curbg]);
-	SystemParametersInfo(SPI_SETDESKWALLPAPER, 0, state->bgs[state->curbg], SPIF_SENDCHANGE);
+	printf(L"Setting:[%d]%s\n", state->curbg, state->bgs[state->curbg]);
+	setWallpaper(state->bgs[state->curbg]);
 }
 
 int keyDown(int vk) {
@@ -623,7 +663,6 @@ int winKeyDown(void) {
 	return keyDown(VK_LWIN) || keyDown(VK_RWIN);
 }
 
-//still holding the registered combo? used for hold-to-cycle
 int isNextHeld(void) {
 	return winKeyDown() && keyDown(VK_SHIFT) && keyDown('N');
 }
@@ -642,19 +681,17 @@ void stopHoldCycle(UINT_PTR* holdTimer, int* holdDir) {
 void startHoldCycle(int dir, UINT_PTR* holdTimer, int* holdDir) {
 	*holdDir = dir;
 	if(*holdTimer) KillTimer(NULL, *holdTimer);
-	//first follow-up is a hair slower so a tap doesnt double-fire
 	*holdTimer = SetTimer(NULL, TIMER_HOLD, HOLD_INITIAL_MS, NULL);
 }
 
 void UpdateTrayTip(HWND hwnd) {
-	NOTIFYICONDATAA nid = {0};
-	nid.cbSize = sizeof(NOTIFYICONDATAA);
+	NOTIFYICONDATAW nid = {0};
+	nid.cbSize = sizeof(NOTIFYICONDATAW);
 	nid.hWnd = hwnd;
 	nid.uID = TRAY_ICON_ID;
 	nid.uFlags = NIF_TIP;
-	//szTip is 128 chars - plenty for a quick inventory
-	wsprintfA(nid.szTip, "%s\nSFW: %d | NSFW: %d", APP_NAME, g_sfwCount, g_nsfwCount);
-	Shell_NotifyIconA(NIM_MODIFY, &nid);
+	wsprintfW(nid.szTip, L"%s\nSFW: %d | NSFW: %d", APP_NAME, g_sfwCount, g_nsfwCount);
+	Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -665,43 +702,43 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 				GetCursorPos(&pt);
 				HMENU hMenu = CreatePopupMenu();
 
-				char infoLine[64];
-				wsprintfA(infoLine, "Loaded  SFW: %d  |  NSFW: %d", g_sfwCount, g_nsfwCount);
-				AppendMenuA(hMenu, MF_STRING | MF_GRAYED, 0, infoLine);
-				AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
+				wchar_t infoLine[64];
+				wsprintfW(infoLine, L"Loaded  SFW: %d  |  NSFW: %d", g_sfwCount, g_nsfwCount);
+				AppendMenuW(hMenu, MF_STRING | MF_GRAYED, 0, infoLine);
+				AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
 
-				AppendMenuA(hMenu, MF_STRING, HK_NEXT_BG, "Next Background\tWin+Shift-N");
-				AppendMenuA(hMenu, MF_STRING, HK_PREV_BG, "Previous Background\tWin+Shift-B");
-				AppendMenuA(hMenu, MF_STRING | (settings.loop_pause ? MF_CHECKED : MF_UNCHECKED), HK_PAUSE, "Toggle Pause\tWin+Alt-P");
-				
-				char nsfwMenuText[64];
+				AppendMenuW(hMenu, MF_STRING, HK_NEXT_BG, L"Next Background\tWin+Shift-N");
+				AppendMenuW(hMenu, MF_STRING, HK_PREV_BG, L"Previous Background\tWin+Shift-B");
+				AppendMenuW(hMenu, MF_STRING | (settings.loop_pause ? MF_CHECKED : MF_UNCHECKED), HK_PAUSE, L"Toggle Pause\tWin+Alt-P");
+
+				wchar_t nsfwMenuText[64];
 				UINT nsfwState = MF_UNCHECKED;
 				if (settings.nsfw == 0) {
-					lstrcpynA(nsfwMenuText, "NSFW Mode: Off\tWin+Shift-X", sizeof(nsfwMenuText));
+					wcpy(nsfwMenuText, L"NSFW Mode: Off\tWin+Shift-X", 64);
 				} else if (settings.nsfw == 1) {
-					lstrcpynA(nsfwMenuText, "[-] NSFW Mode: Combined\tWin+Shift-X", sizeof(nsfwMenuText));
+					wcpy(nsfwMenuText, L"[-] NSFW Mode: Combined\tWin+Shift-X", 64);
 				} else {
-					lstrcpynA(nsfwMenuText, "NSFW Mode: Only NSFW\tWin+Shift-X", sizeof(nsfwMenuText));
+					wcpy(nsfwMenuText, L"NSFW Mode: Only NSFW\tWin+Shift-X", 64);
 					nsfwState = MF_CHECKED;
 				}
-				AppendMenuA(hMenu, MF_STRING | nsfwState, HK_TOGGLE_NSFW, nsfwMenuText);
-				
-				AppendMenuA(hMenu, MF_STRING | (settings.onlyFavs ? MF_CHECKED : MF_UNCHECKED), HK_CYCLE_FAVS, "Toggle Cycle Favs\tWin+Shift-L");
-				AppendMenuA(hMenu, MF_STRING | (settings.notifications ? MF_CHECKED : MF_UNCHECKED), HK_TOGGLE_NOTIF, "Toggle Notifications\tWin+Alt-N");
-				AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
-				AppendMenuA(hMenu, MF_STRING, HK_SAVE_FAV, "Save Favorite\tWin+Shift-A");
-				AppendMenuA(hMenu, MF_STRING, HK_CLEAR_FAVS, "Clear Favorites\tWin+Shift-C");
-				AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
-				AppendMenuA(hMenu, MF_STRING, HK_TOGGLE_ICONS, "Toggle Desktop Icons\tWin+Shift-Z");
-				AppendMenuA(hMenu, MF_STRING, HK_OPEN_EXPLORER, "Open in Explorer\tWin+Shift-O");
-				AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
-				AppendMenuA(hMenu, MF_STRING, HK_QUIT, "Quit\tWin+Alt-Q");
-				
-				SetForegroundWindow(hwnd); //menu needs this or it sticks around like a bad roommate
+				AppendMenuW(hMenu, MF_STRING | nsfwState, HK_TOGGLE_NSFW, nsfwMenuText);
+
+				AppendMenuW(hMenu, MF_STRING | (settings.onlyFavs ? MF_CHECKED : MF_UNCHECKED), HK_CYCLE_FAVS, L"Toggle Cycle Favs\tWin+Shift-L");
+				AppendMenuW(hMenu, MF_STRING | (settings.notifications ? MF_CHECKED : MF_UNCHECKED), HK_TOGGLE_NOTIF, L"Toggle Notifications\tWin+Alt-N");
+				AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+				AppendMenuW(hMenu, MF_STRING, HK_SAVE_FAV, L"Save Favorite\tWin+Shift-A");
+				AppendMenuW(hMenu, MF_STRING, HK_CLEAR_FAVS, L"Clear Favorites\tWin+Shift-C");
+				AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+				AppendMenuW(hMenu, MF_STRING, HK_TOGGLE_ICONS, L"Toggle Desktop Icons\tWin+Shift-Z");
+				AppendMenuW(hMenu, MF_STRING, HK_OPEN_EXPLORER, L"Open in Explorer\tWin+Shift-O");
+				AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+				AppendMenuW(hMenu, MF_STRING, HK_QUIT, L"Quit\tWin+Alt-Q");
+
+				SetForegroundWindow(hwnd);
 				int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, NULL);
-				PostMessage(hwnd, WM_NULL, 0, 0); //Windows being windows...
+				PostMessage(hwnd, WM_NULL, 0, 0);
 				DestroyMenu(hMenu);
-				
+
 				if (cmd != 0) {
 					if (cmd == HK_QUIT) {
 						PostQuitMessage(0);
@@ -715,56 +752,56 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			PostQuitMessage(0);
 			break;
 		case WM_TIMER:
-			if (wParam == TIMER_TOAST) { 
+			if (wParam == TIMER_TOAST) {
 				KillTimer(hwnd, TIMER_TOAST);
-				NOTIFYICONDATAA nid = {0};
-				nid.cbSize = sizeof(NOTIFYICONDATAA);
+				NOTIFYICONDATAW nid = {0};
+				nid.cbSize = sizeof(NOTIFYICONDATAW);
 				nid.hWnd = hwnd;
 				nid.uID = TRAY_ICON_ID;
 				nid.uFlags = NIF_INFO;
-				nid.szInfo[0] = '\0';
-				Shell_NotifyIconA(NIM_MODIFY, &nid);
+				nid.szInfo[0] = 0;
+				Shell_NotifyIconW(NIM_MODIFY, &nid);
 			}
 			break;
 		default:
-			return DefWindowProcA(hwnd, msg, wParam, lParam);
+			return DefWindowProcW(hwnd, msg, wParam, lParam);
 	}
 	return 0;
 }
 
 void InitTrayIcon(HWND hwnd) {
-	NOTIFYICONDATAA nid = {0};
-	nid.cbSize = sizeof(NOTIFYICONDATAA);
+	NOTIFYICONDATAW nid = {0};
+	nid.cbSize = sizeof(NOTIFYICONDATAW);
 	nid.hWnd = hwnd;
 	nid.uID = TRAY_ICON_ID;
 	nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
 	nid.uCallbackMessage = WM_TRAYICON;
-	nid.hIcon = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_APP_ICON));
-	lstrcpynA(nid.szTip, APP_NAME, sizeof(nid.szTip));
-	Shell_NotifyIconA(NIM_ADD, &nid);
+	nid.hIcon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(IDI_APP_ICON));
+	wcpy(nid.szTip, APP_NAME, 128);
+	Shell_NotifyIconW(NIM_ADD, &nid);
 }
 
 void RemoveTrayIcon(HWND hwnd) {
-	NOTIFYICONDATAA nid = {0};
-	nid.cbSize = sizeof(NOTIFYICONDATAA);
+	NOTIFYICONDATAW nid = {0};
+	nid.cbSize = sizeof(NOTIFYICONDATAW);
 	nid.hWnd = hwnd;
 	nid.uID = TRAY_ICON_ID;
-	Shell_NotifyIconA(NIM_DELETE, &nid);
+	Shell_NotifyIconW(NIM_DELETE, &nid);
 }
 
-void ShowNotification(HWND hwnd, const char* title, const char* message, int timeoutMs) {
+void ShowNotification(HWND hwnd, const wchar_t* title, const wchar_t* message, int timeoutMs) {
 	if (!settings.notifications) return;
 
-	NOTIFYICONDATAA nid = {0};
-	nid.cbSize = sizeof(NOTIFYICONDATAA);
+	NOTIFYICONDATAW nid = {0};
+	nid.cbSize = sizeof(NOTIFYICONDATAW);
 	nid.hWnd = hwnd;
 	nid.uID = TRAY_ICON_ID;
 	nid.uFlags = NIF_INFO;
-	lstrcpynA(nid.szInfoTitle, title, sizeof(nid.szInfoTitle));
-	lstrcpynA(nid.szInfo, message, sizeof(nid.szInfo));
+	wcpy(nid.szInfoTitle, title, 64);
+	wcpy(nid.szInfo, message, 256);
 	nid.dwInfoFlags = NIIF_NOSOUND;
 	nid.uTimeout = timeoutMs;
-	Shell_NotifyIconA(NIM_MODIFY, &nid);
+	Shell_NotifyIconW(NIM_MODIFY, &nid);
 
 	if (timeoutMs > 0) {
 		SetTimer(hwnd, TIMER_TOAST, timeoutMs, NULL);
@@ -780,7 +817,7 @@ void bumpAutoTimer(UINT_PTR* timerId, UINT timerInterval) {
 	}
 }
 
-void HandleHotkey(int hotkeyId, AppState* appState, HWND hwnd, char* efavfpath,
+void HandleHotkey(int hotkeyId, AppState* appState, HWND hwnd, const wchar_t* efavfpath,
 	UINT_PTR* timerId, UINT timerInterval, int* running,
 	UINT_PTR* holdTimer, int* holdDir) {
 	switch (hotkeyId) {
@@ -791,17 +828,16 @@ void HandleHotkey(int hotkeyId, AppState* appState, HWND hwnd, char* efavfpath,
 		case HK_TOGGLE_ICONS:
 			{
 				HWND hShellViewWin = gethShellViewWin();
-				if(hShellViewWin) SendMessage(hShellViewWin,0x0111, 0x7402, 0);
+				if(hShellViewWin) SendMessage(hShellViewWin, 0x0111, 0x7402, 0);
 			}
 			break;
 		case HK_SAVE_FAV:
 			upsertIntStack(appState->favs, appState->curbg);
 			saveFavs(efavfpath, appState->favs, appState->bgs);
 			printFavs(appState->favs, appState->bgs);
-			ShowNotification(hwnd, "Favorites", "Saved current background to favorites!", TOAST_DURATION_MS);
+			ShowNotification(hwnd, L"Favorites", L"Saved current background to favorites!", TOAST_DURATION_MS);
 			break;
 		case HK_NEXT_BG:
-			//tap = one step; hold = keep stepping via TIMER_HOLD + GetAsyncKeyState
 			bumpAutoTimer(timerId, timerInterval);
 			AdvanceBackground(appState);
 			startHoldCycle(HOLD_NEXT, holdTimer, holdDir);
@@ -818,105 +854,109 @@ void HandleHotkey(int hotkeyId, AppState* appState, HWND hwnd, char* efavfpath,
 			if (settings.loop_pause) {
 				if (*timerId) KillTimer(NULL, *timerId);
 				*timerId = 0;
-				ShowNotification(hwnd, APP_NAME, "Auto Rotate: Paused", TOAST_DURATION_MS);
+				ShowNotification(hwnd, APP_NAME, L"Auto Rotate: Paused", TOAST_DURATION_MS);
 			} else {
 				if (*timerId) KillTimer(NULL, *timerId);
 				*timerId = SetTimer(NULL, TIMER_MAIN, timerInterval, NULL);
-				ShowNotification(hwnd, APP_NAME, "Auto Rotate: Resumed", TOAST_DURATION_MS);
+				ShowNotification(hwnd, APP_NAME, L"Auto Rotate: Resumed", TOAST_DURATION_MS);
 			}
 			saveSettings(efavfpath, &settings);
 			break;
 		case HK_TOGGLE_NSFW:
 			settings.nsfw = ++settings.nsfw % 3;
-			printf("NSFW:%d\n", settings.nsfw);
-			if (settings.nsfw == 0) ShowNotification(hwnd, "NSFW Mode", "Off", TOAST_DURATION_MS);
-			else if (settings.nsfw == 1) ShowNotification(hwnd, "NSFW Mode", "Combined", TOAST_DURATION_MS);
-			else ShowNotification(hwnd, "NSFW Mode", "Only NSFW", TOAST_DURATION_MS);
+			printf(L"NSFW:%d\n", settings.nsfw);
+			if (settings.nsfw == 0) ShowNotification(hwnd, L"NSFW Mode", L"Off", TOAST_DURATION_MS);
+			else if (settings.nsfw == 1) ShowNotification(hwnd, L"NSFW Mode", L"Combined", TOAST_DURATION_MS);
+			else ShowNotification(hwnd, L"NSFW Mode", L"Only NSFW", TOAST_DURATION_MS);
 			saveSettings(efavfpath, &settings);
 			break;
 		case HK_CYCLE_FAVS:
 			settings.onlyFavs ^= 1;
-			printf("Cycle:%s\n", (settings.onlyFavs ? "Only Favorites" : "Normal"));
-			ShowNotification(hwnd, "Cycle Mode", settings.onlyFavs ? "Only Favorites" : "Normal", TOAST_DURATION_MS);
+			printf(L"Cycle:%s\n", (settings.onlyFavs ? L"Only Favorites" : L"Normal"));
+			ShowNotification(hwnd, L"Cycle Mode", settings.onlyFavs ? L"Only Favorites" : L"Normal", TOAST_DURATION_MS);
 			saveSettings(efavfpath, &settings);
 			break;
 		case HK_CLEAR_FAVS:
-			printf("Clearing Favorites\n");
+			printf(L"Clearing Favorites\n");
 			appState->favs->top = -1;
 			appState->favs->pointer = 0;
 			ZeroMemory(appState->favs->inds, sizeof(int) * MAX_iSTACK_SIZE);
 			saveFavs(efavfpath, appState->favs, appState->bgs);
-			ShowNotification(hwnd, "Favorites", "Cleared all favorites!", TOAST_DURATION_MS);
+			ShowNotification(hwnd, L"Favorites", L"Cleared all favorites!", TOAST_DURATION_MS);
 			break;
 		case HK_OPEN_EXPLORER:
 			{
-				char args[MAX_PATH + 32] = {0};
-				wsprintfA(args, "/select,\"%s\"", appState->bgs[appState->curbg]);
-				ShellExecuteA(NULL, "open", "explorer.exe", args, NULL, SW_SHOWNORMAL);
+				wchar_t args[PATH_CCH + 32] = {0};
+				wsprintfW(args, L"/select,\"%s\"", appState->bgs[appState->curbg]);
+				ShellExecuteW(NULL, L"open", L"explorer.exe", args, NULL, SW_SHOWNORMAL);
 			}
 			break;
 		case HK_TOGGLE_NOTIF:
 			settings.notifications ^= 1;
 			saveSettings(efavfpath, &settings);
 			if (settings.notifications) {
-				ShowNotification(hwnd, APP_NAME, "Notifications Enabled", TOAST_DURATION_MS);
+				ShowNotification(hwnd, APP_NAME, L"Notifications Enabled", TOAST_DURATION_MS);
 			}
 			break;
 	}
 }
 
-void RegisterAppHotkeys() {
-	char hkErrors[1024] = {0};
+void RegisterAppHotkeys(void) {
+	wchar_t hkErrors[1024] = {0};
 
-	if(!RegisterHotKey(NULL, HK_QUIT, MOD_WIN | MOD_ALT | MOD_NOREPEAT, 'Q')) lstrcatA(hkErrors, "- Win+Alt-Q (Quit)\n");
-	if(!RegisterHotKey(NULL, HK_TOGGLE_ICONS, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'Z')) lstrcatA(hkErrors, "- Win+Shift-Z (Toggle Icons)\n");
-	if(!RegisterHotKey(NULL, HK_SAVE_FAV, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'A')) lstrcatA(hkErrors, "- Win+Shift-A (Save Fav)\n");
-	if(!RegisterHotKey(NULL, HK_NEXT_BG, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'N')) lstrcatA(hkErrors, "- Win+Shift-N (Next BG)\n");
-	if(!RegisterHotKey(NULL, HK_PREV_BG, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'B')) lstrcatA(hkErrors, "- Win+Shift-B (Prev BG)\n");
-	if(!RegisterHotKey(NULL, HK_PAUSE, MOD_WIN | MOD_ALT | MOD_NOREPEAT, 'P')) lstrcatA(hkErrors, "- Win+Alt-P (Pause)\n");
-	if(!RegisterHotKey(NULL, HK_TOGGLE_NSFW, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'X')) lstrcatA(hkErrors, "- Win+Shift-X (Toggle NSFW)\n");
-	if(!RegisterHotKey(NULL, HK_CYCLE_FAVS, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'L')) lstrcatA(hkErrors, "- Win+Shift-L (Cycle Favs)\n");
-	if(!RegisterHotKey(NULL, HK_CLEAR_FAVS, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'C')) lstrcatA(hkErrors, "- Win+Shift-C (Clear Favs)\n");
-	if(!RegisterHotKey(NULL, HK_OPEN_EXPLORER, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'O')) lstrcatA(hkErrors, "- Win+Shift-O (Open Explorer)\n");
-	if(!RegisterHotKey(NULL, HK_TOGGLE_NOTIF, MOD_WIN | MOD_ALT | MOD_NOREPEAT, 'N')) lstrcatA(hkErrors, "- Win+Alt-N (Toggle Notifications)\n");
+	if(!RegisterHotKey(NULL, HK_QUIT, MOD_WIN | MOD_ALT | MOD_NOREPEAT, 'Q')) lstrcatW(hkErrors, L"- Win+Alt-Q (Quit)\n");
+	if(!RegisterHotKey(NULL, HK_TOGGLE_ICONS, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'Z')) lstrcatW(hkErrors, L"- Win+Shift-Z (Toggle Icons)\n");
+	if(!RegisterHotKey(NULL, HK_SAVE_FAV, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'A')) lstrcatW(hkErrors, L"- Win+Shift-A (Save Fav)\n");
+	if(!RegisterHotKey(NULL, HK_NEXT_BG, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'N')) lstrcatW(hkErrors, L"- Win+Shift-N (Next BG)\n");
+	if(!RegisterHotKey(NULL, HK_PREV_BG, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'B')) lstrcatW(hkErrors, L"- Win+Shift-B (Prev BG)\n");
+	if(!RegisterHotKey(NULL, HK_PAUSE, MOD_WIN | MOD_ALT | MOD_NOREPEAT, 'P')) lstrcatW(hkErrors, L"- Win+Alt-P (Pause)\n");
+	if(!RegisterHotKey(NULL, HK_TOGGLE_NSFW, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'X')) lstrcatW(hkErrors, L"- Win+Shift-X (Toggle NSFW)\n");
+	if(!RegisterHotKey(NULL, HK_CYCLE_FAVS, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'L')) lstrcatW(hkErrors, L"- Win+Shift-L (Cycle Favs)\n");
+	if(!RegisterHotKey(NULL, HK_CLEAR_FAVS, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'C')) lstrcatW(hkErrors, L"- Win+Shift-C (Clear Favs)\n");
+	if(!RegisterHotKey(NULL, HK_OPEN_EXPLORER, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, 'O')) lstrcatW(hkErrors, L"- Win+Shift-O (Open Explorer)\n");
+	if(!RegisterHotKey(NULL, HK_TOGGLE_NOTIF, MOD_WIN | MOD_ALT | MOD_NOREPEAT, 'N')) lstrcatW(hkErrors, L"- Win+Alt-N (Toggle Notifications)\n");
 
-	if (hkErrors[0] != '\0') {
-		char errorMsg[2048] = {0};
-		wsprintfA(errorMsg, "The following hotkeys failed to register (they might be in use by Windows or another app):\n\n%s", hkErrors);
-		MessageBoxA(0, errorMsg, "Hotkey Registration Warning", MB_ICONWARNING | MB_OK);
+	if (hkErrors[0] != 0) {
+		wchar_t errorMsg[2048] = {0};
+		wsprintfW(errorMsg, L"The following hotkeys failed to register (they might be in use by Windows or another app):\n\n%s", hkErrors);
+		MessageBoxW(0, errorMsg, L"Hotkey Registration Warning", MB_ICONWARNING | MB_OK);
 	}
 }
 
-void UnregisterAppHotkeys() {
+void UnregisterAppHotkeys(void) {
 	for (int i = HK_QUIT; i <= HK_TOGGLE_NOTIF; i++) {
 		UnregisterHotKey(NULL, i);
 	}
 }
 
-HWND InitializeHiddenWindow() {
-	WNDCLASSA wc = {0};
+HWND InitializeHiddenWindow(void) {
+	WNDCLASSW wc = {0};
 	wc.lpfnWndProc = WndProc;
-	wc.hInstance = GetModuleHandle(NULL);
-	wc.hIcon = LoadIcon(wc.hInstance, MAKEINTRESOURCE(IDI_APP_ICON));
+	wc.hInstance = GetModuleHandleW(NULL);
+	wc.hIcon = LoadIconW(wc.hInstance, MAKEINTRESOURCEW(IDI_APP_ICON));
 	wc.lpszClassName = APP_CLASS;
-	RegisterClassA(&wc);
-	HWND hwnd = CreateWindowA(wc.lpszClassName, APP_NAME, 0, 0, 0, 0, 0, NULL, NULL, wc.hInstance, NULL);
+	RegisterClassW(&wc);
+	HWND hwnd = CreateWindowW(wc.lpszClassName, APP_NAME, 0, 0, 0, 0, 0, NULL, NULL, wc.hInstance, NULL);
 	InitTrayIcon(hwnd);
 	return hwnd;
 }
 
-int main(int argc, char *argv[]) {
-	//one instance only - second launch just nags and peaces out
-	HANDLE hMutex = CreateMutexA(NULL, FALSE, MUTEX_NAME);
+int main(void) {
+	int argc = 0;
+	LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+
+	HANDLE hMutex = CreateMutexW(NULL, FALSE, MUTEX_NAME);
 	if(!hMutex) {
-		MessageBoxA(0, "Failed to create single-instance mutex.", APP_NAME, MB_ICONERROR | MB_OK);
+		MessageBoxW(0, L"Failed to create single-instance mutex.", APP_NAME, MB_ICONERROR | MB_OK);
+		if(argv) LocalFree(argv);
 		return 1;
 	}
 	if(GetLastError() == ERROR_ALREADY_EXISTS) {
-		MessageBoxA(0,
-			"BackgroundHotkeyThing is already running.\nCheck the tray / notification area.",
+		MessageBoxW(0,
+			L"BackgroundHotkeyThing is already running.\nCheck the tray / notification area.",
 			APP_NAME, MB_ICONINFORMATION | MB_OK);
 		CloseHandle(hMutex);
+		if(argv) LocalFree(argv);
 		return 0;
 	}
 
@@ -924,18 +964,19 @@ int main(int argc, char *argv[]) {
 	AppState appState = {0};
 	appState.nsfwIndex = DEFAULT_NSFW_INDEX;
 	appState.favs = xmalloc(sizeof(intStack));
-	
+
 	if (!appState.favs) {
-		MessageBoxA(0, "Failed to allocate memory.", APP_NAME, MB_ICONERROR | MB_OK);
+		MessageBoxW(0, L"Failed to allocate memory.", APP_NAME, MB_ICONERROR | MB_OK);
 		CloseHandle(hMutex);
+		if(argv) LocalFree(argv);
 		return 1;
 	}
-	
+
 	ZeroMemory(appState.favs->inds, sizeof(int)*MAX_iSTACK_SIZE);
 	appState.favs->top = -1;
 	appState.favs->pointer = 0;
 
-	char orgPaper[MAX_PATH] = {0x00};
+	wchar_t orgPaper[PATH_CCH] = {0};
 	int running = 1;
 	int approx_minutes = 2;
 	settings.loop_pause = 0;
@@ -943,36 +984,44 @@ int main(int argc, char *argv[]) {
 	settings.onlyFavs = 0;
 	settings.notifications = 1;
 
-	if(argc < 2) {
-		MessageBoxA(0,"Usage: BackgroundHotkeyThing.exe <path to BG images> <rotation delay in minutes>\nNOTE: single folder(non-recursive)\n","Woops",0);
+	if(!argv || argc < 2) {
+		wchar_t usage[512];
+		wsprintfW(usage,
+			L"Usage: BackgroundHotkeyThing.exe <path to BG images> <rotation delay in minutes>\n\n"
+			L"Scans nested folders (depth %d) for png/jpg/jpeg/bmp.\n"
+			L"Any path segment named NSFW is treated as NSFW (case-insensitive).",
+			SCAN_MAX_DEPTH);
+		MessageBoxW(0, usage, L"Woops", MB_OK);
 		xfree(appState.favs);
 		CloseHandle(hMutex);
+		if(argv) LocalFree(argv);
 		return 0;
 	}
-	
+
 	if(argc > 2) {
-		int tmp = parsePositiveInt(argv[2]);
-		approx_minutes = (tmp > 0  ? tmp : approx_minutes);
+		int tmp = parsePositiveIntW(argv[2]);
+		approx_minutes = (tmp > 0 ? tmp : approx_minutes);
 	}
-	
-	char relpath[MAX_PATH] = {0};
-	if(!resolveBgPath(argv[1], relpath, MAX_PATH)) {
-		MessageBoxA(0, "Could not resolve background folder path.", "Woops", MB_ICONERROR | MB_OK);
+
+	wchar_t relpath[PATH_CCH] = {0};
+	if(!resolveBgPathW(argv[1], relpath, PATH_CCH)) {
+		MessageBoxW(0, L"Could not resolve background folder path.", L"Woops", MB_ICONERROR | MB_OK);
 		xfree(appState.favs);
 		CloseHandle(hMutex);
+		LocalFree(argv);
 		return 1;
 	}
-	printf("BG folder: %s\n", relpath);
-	
-	char efavfpath[MAX_PATH] = {0};
-	wsprintfA(efavfpath, "%s\\%s", relpath, INI_FILENAME);
-	
+	printf(L"BG folder: %s\n", relpath);
+
+	wchar_t efavfpath[PATH_CCH] = {0};
+	wsprintfW(efavfpath, L"%s\\%s", relpath, INI_FILENAME);
+
 	//very basic random seed: a little ASLR + SystemTime out of KUSER_SHARED_DATA...
-	CopyMemory(&st,SystemTimePointer,sizeof(st));
-	seedRng((unsigned int)((uintptr_t)&main + (uintptr_t)&ListDirectoryContents) + st.LowPart);
-	
-	appState.numBgs = initBGs(relpath, &appState, orgPaper);
-	
+	CopyMemory(&st, SystemTimePointer, sizeof(st));
+	seedRng((unsigned int)((uintptr_t)&main + (uintptr_t)&ListDirectoryContentsW) + st.LowPart);
+
+	appState.numBgs = initBGs(relpath, &appState, orgPaper, PATH_CCH);
+
 	if(appState.numBgs == 0) {
 		if (appState.bgs) {
 			if (appState.bgs[0]) xfree(appState.bgs[0]);
@@ -980,21 +1029,22 @@ int main(int argc, char *argv[]) {
 		}
 		if(appState.favs) xfree(appState.favs);
 		CloseHandle(hMutex);
+		LocalFree(argv);
 		return 1;
 	}
-	
+
 	importFavs(efavfpath, appState.favs, appState.bgs, appState.numBgs);
 	loadSettings(efavfpath, &settings);
 	if(appState.nsfwIndex < 2){
-		printf("!!!!! NSFW images Loaded, NSFW enabled !!!!!\n");
+		//only NSFW images (or nothing SFW) — nudge mode on
+		printf(L"!!!!! no SFW partition, NSFW enabled !!!!!\n");
 		settings.nsfw = 1;
 		saveSettings(efavfpath, &settings);
 	}
 
-	//inventory for tray (exclude bgs[0] launch snapshot from SFW count)
 	g_sfwCount = (appState.nsfwIndex > 1) ? (appState.nsfwIndex - 1) : 0;
 	g_nsfwCount = (appState.numBgs > appState.nsfwIndex) ? (appState.numBgs - appState.nsfwIndex) : 0;
-	printf("Counts SFW:%d NSFW:%d\n", g_sfwCount, g_nsfwCount);
+	printf(L"Counts SFW:%d NSFW:%d (scan depth %d)\n", g_sfwCount, g_nsfwCount, SCAN_MAX_DEPTH);
 
 	HWND hwnd = InitializeHiddenWindow();
 	UpdateTrayTip(hwnd);
@@ -1011,9 +1061,8 @@ int main(int argc, char *argv[]) {
 	}
 	MSG msg = {0};
 
-	while(running && GetMessage(&msg, NULL, 0, 0) > 0) {
+	while(running && GetMessageW(&msg, NULL, 0, 0) > 0) {
 		if (msg.message == WM_TIMER && holdTimer && msg.wParam == holdTimer) {
-			//hold-to-cycle: keep going while combo is down, otherwise peaces out
 			int stillHeld = 0;
 			if(holdDir == HOLD_NEXT) stillHeld = isNextHeld();
 			else if(holdDir == HOLD_PREV) stillHeld = isPrevHeld();
@@ -1026,7 +1075,6 @@ int main(int argc, char *argv[]) {
 					bumpAutoTimer(&timerId, timerInterval);
 					PreviousBackground(&appState);
 				}
-				//crank up to the faster repeat rate after the initial delay
 				KillTimer(NULL, holdTimer);
 				holdTimer = SetTimer(NULL, TIMER_HOLD, HOLD_REPEAT_MS, NULL);
 			} else {
@@ -1039,7 +1087,7 @@ int main(int argc, char *argv[]) {
 				&holdTimer, &holdDir);
 		}
 		TranslateMessage(&msg);
-		DispatchMessage(&msg);
+		DispatchMessageW(&msg);
 	}
 
 	stopHoldCycle(&holdTimer, &holdDir);
@@ -1048,7 +1096,7 @@ int main(int argc, char *argv[]) {
 
 	RemoveTrayIcon(hwnd);
 	DestroyWindow(hwnd);
-	
+
 	if (appState.bgs) {
 		for (int i = 0; i < appState.numBgs; i++) {
 			if (appState.bgs[i]) xfree(appState.bgs[i]);
@@ -1057,5 +1105,6 @@ int main(int argc, char *argv[]) {
 	}
 	if (appState.favs) xfree(appState.favs);
 	CloseHandle(hMutex);
+	LocalFree(argv);
 	return 0;
 }

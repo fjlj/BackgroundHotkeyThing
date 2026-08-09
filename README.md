@@ -30,8 +30,9 @@ mingw32-make clean
 BackgroundHotkeyThing.exe <path-to-images> [minutes]
 ```
 
-- Images: top-level `png` / `jpg` / `jpeg` / `bmp`, plus optional `NSFW\` subfolder  
-- Path: absolute, UNC, or relative to the **exe** directory  
+- Images: `png` / `jpg` / `jpeg` / `bmp`, nested folders up to depth **4** (`SCAN_MAX_DEPTH`)  
+- NSFW: any path segment named `NSFW` (case-insensitive), e.g. `Albums\Beach\NSFW\x.jpg`  
+- Path: absolute, UNC, or relative to the **exe** directory (Unicode / wide APIs)  
 - Minutes: auto-rotate interval (default 2 if omitted)
 
 ## Setup helper

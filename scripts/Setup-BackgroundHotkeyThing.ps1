@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
   Set up BackgroundHotkeyThing against a wallpaper folder.
@@ -201,53 +201,66 @@ function New-Shortcut {
     [System.Runtime.InteropServices.Marshal]::ReleaseComObject($w) | Out-Null
 }
 
+# matches main.c SCAN_MAX_DEPTH — root + this many nested folder levels
+$script:ScanMaxDepth = 4
+
+function Test-PathHasNsfwSegment([string]$FullPath) {
+    $parts = $FullPath -split '[\\/]'
+    foreach ($p in $parts) {
+        if ($p -and ($p -ieq 'NSFW')) { return $true }
+    }
+    return $false
+}
+
 function Get-FolderScan {
     param([string]$Root)
 
     $sfw = New-Object System.Collections.Generic.List[object]
     $nsfw = New-Object System.Collections.Generic.List[object]
     $unsupported = @{}
-    $otherDirs = New-Object System.Collections.Generic.List[string]
     $tooLong = New-Object System.Collections.Generic.List[string]
+    $nestedDirs = 0
 
     if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
         return $null
     }
 
-    Get-ChildItem -LiteralPath $Root -File -ErrorAction SilentlyContinue | ForEach-Object {
-        $ext = $_.Extension.ToLowerInvariant()
-        if ($Supported -contains $ext) {
-            [void]$sfw.Add($_)
-            if ($_.FullName.Length -ge 240) { [void]$tooLong.Add($_.FullName) }
-        } elseif ($UnsupportedButCommon -contains $ext) {
-            if (-not $unsupported.ContainsKey($ext)) { $unsupported[$ext] = 0 }
-            $unsupported[$ext]++
-        }
-    }
-
-    Get-ChildItem -LiteralPath $Root -Directory -ErrorAction SilentlyContinue | ForEach-Object {
-        if ($_.Name -ieq 'NSFW') {
-            Get-ChildItem -LiteralPath $_.FullName -File -ErrorAction SilentlyContinue | ForEach-Object {
+    # depth 0 = root; recurse while depth < ScanMaxDepth (same idea as main.c)
+    function Walk([string]$Dir, [int]$Depth) {
+        Get-ChildItem -LiteralPath $Dir -Force -ErrorAction SilentlyContinue | ForEach-Object {
+            if ($_.PSIsContainer) {
+                if ($_.Name -eq '.' -or $_.Name -eq '..') { return }
+                if ($Depth -lt $script:ScanMaxDepth) {
+                    $script:nestedDirsRef++
+                    Walk -Dir $_.FullName -Depth ($Depth + 1)
+                }
+            } else {
                 $ext = $_.Extension.ToLowerInvariant()
                 if ($Supported -contains $ext) {
-                    [void]$nsfw.Add($_)
                     if ($_.FullName.Length -ge 240) { [void]$tooLong.Add($_.FullName) }
+                    if (Test-PathHasNsfwSegment $_.FullName) {
+                        [void]$nsfw.Add($_)
+                    } else {
+                        [void]$sfw.Add($_)
+                    }
                 } elseif ($UnsupportedButCommon -contains $ext) {
                     if (-not $unsupported.ContainsKey($ext)) { $unsupported[$ext] = 0 }
                     $unsupported[$ext]++
                 }
             }
-        } else {
-            [void]$otherDirs.Add($_.Name)
         }
     }
+
+    $script:nestedDirsRef = 0
+    Walk -Dir $Root -Depth 0
+    $nestedDirs = $script:nestedDirsRef
 
     [pscustomobject]@{
         SfwCount       = $sfw.Count
         NsfwCount      = $nsfw.Count
         TotalSupported = $sfw.Count + $nsfw.Count
         Unsupported    = $unsupported
-        OtherDirs      = $otherDirs
+        NestedDirs     = $nestedDirs
         TooLong        = $tooLong
         HasNsfwDir     = Test-Path -LiteralPath (Join-Path $Root 'NSFW') -PathType Container
     }
@@ -370,7 +383,8 @@ $scan = Get-FolderScan -Root $WallpaperPath
 Write-Host ""
 Write-Host "  What we found:" -ForegroundColor White
 Write-Info "Normal (SFW) images : $($scan.SfwCount)"
-Write-Info "NSFW folder images  : $($scan.NsfwCount)"
+Write-Info "NSFW-path images    : $($scan.NsfwCount)  (any folder segment named NSFW)"
+Write-Info "Nested folders seen : $($scan.NestedDirs)  (max depth $script:ScanMaxDepth)"
 Write-Info "Total usable        : $($scan.TotalSupported)"
 Write-Host ""
 
@@ -399,10 +413,8 @@ if ($scan.Unsupported.Count -gt 0) {
     Write-Info "Tip: convert those to jpg or png if you want them in the rotation."
 }
 
-if ($scan.OtherDirs.Count -gt 0) {
-    Write-Warn "Other subfolders are ignored (not recursive): $($scan.OtherDirs -join ', ')"
-    Write-Info "Only files directly in the folder + NSFW\ count."
-    $warns++
+if ($scan.NestedDirs -gt 0) {
+    Write-Info "Nested folders are included (up to depth $script:ScanMaxDepth)."
 }
 
 if ($scan.TooLong.Count -gt 0) {
@@ -467,19 +479,19 @@ $nsfwPath = Join-Path $WallpaperPath 'NSFW'
 if (-not $scan.HasNsfwDir) {
     $doNsfw = $CreateNsfw
     if (-not $doNsfw -and -not $NoNsfwPrompt -and $Interactive) {
-        Write-Host "  Some people keep a separate set of images in a subfolder named NSFW." -ForegroundColor DarkGray
-        Write-Host "  You can hide/show them with a hotkey (Win+Shift-X). Completely optional." -ForegroundColor DarkGray
-        $doNsfw = Read-YesNo "Create an empty NSFW folder now?" $false
+        Write-Host "  Any folder named NSFW (anywhere under this tree) counts as NSFW mode." -ForegroundColor DarkGray
+        Write-Host "  Hide/show with Win+Shift-X. Completely optional." -ForegroundColor DarkGray
+        $doNsfw = Read-YesNo "Create an empty top-level NSFW folder now?" $false
     }
     if ($doNsfw) {
         New-Item -ItemType Directory -Path $nsfwPath -Force | Out-Null
         Write-Ok "Created $nsfwPath"
-        Write-Info "Drop images there anytime. Toggle modes with Win+Shift-X."
+        Write-Info "You can also use Album\NSFW\... inside nested folders."
     } else {
-        Write-Info "Skipped NSFW folder (you can create NSFW\ later by hand)."
+        Write-Info "Skipped creating NSFW\ (you can add NSFW folders later by hand)."
     }
 } else {
-    Write-Ok "NSFW folder already there ($($scan.NsfwCount) image(s))"
+    Write-Ok "Top-level NSFW\ present (total NSFW-path images: $($scan.NsfwCount))"
 }
 
 # --- Step 6: shortcuts ---
