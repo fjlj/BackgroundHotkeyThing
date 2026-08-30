@@ -1,11 +1,12 @@
 # Portable MinGW build — gcc/windres on PATH.
-#   mingw32-make          -> build/BackgroundHotkeyThing.exe
+#   build.bat / build.sh  -> build/BackgroundHotkeyThing.exe
+#   mingw32-make
 #   mingw32-make clean
 
 CC      = gcc
 WINDRES = windres
 CFLAGS  = -O2 -mwindows
-LDFLAGS = -static-libgcc -mwindows -s -lshell32
+LDFLAGS = -static-libgcc -mwindows -s -lshell32 -lole32 -luuid
 
 BUILD   = build
 TARGET  = $(BUILD)/BackgroundHotkeyThing.exe

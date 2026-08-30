@@ -220,6 +220,7 @@ function Get-FolderScan {
     $unsupported = @{}
     $tooLong = New-Object System.Collections.Generic.List[string]
     $nestedDirs = 0
+    $ignoredDirs = 0
 
     if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
         return $null
@@ -230,6 +231,10 @@ function Get-FolderScan {
         Get-ChildItem -LiteralPath $Dir -Force -ErrorAction SilentlyContinue | ForEach-Object {
             if ($_.PSIsContainer) {
                 if ($_.Name -eq '.' -or $_.Name -eq '..') { return }
+                if ($_.Name -like 'ignore-*') {
+                    $script:ignoredDirsRef++
+                    return
+                }
                 if ($Depth -lt $script:ScanMaxDepth) {
                     $script:nestedDirsRef++
                     Walk -Dir $_.FullName -Depth ($Depth + 1)
@@ -252,8 +257,10 @@ function Get-FolderScan {
     }
 
     $script:nestedDirsRef = 0
+    $script:ignoredDirsRef = 0
     Walk -Dir $Root -Depth 0
     $nestedDirs = $script:nestedDirsRef
+    $ignoredDirs = $script:ignoredDirsRef
 
     [pscustomobject]@{
         SfwCount       = $sfw.Count
@@ -261,6 +268,7 @@ function Get-FolderScan {
         TotalSupported = $sfw.Count + $nsfw.Count
         Unsupported    = $unsupported
         NestedDirs     = $nestedDirs
+        IgnoredDirs    = $ignoredDirs
         TooLong        = $tooLong
         HasNsfwDir     = Test-Path -LiteralPath (Join-Path $Root 'NSFW') -PathType Container
     }
@@ -333,7 +341,8 @@ if (-not $WallpaperPath) {
 
     Write-Host "  This is the folder that holds your wallpaper images." -ForegroundColor DarkGray
     Write-Host "  Supported: .png  .jpg  .jpeg  .bmp" -ForegroundColor DarkGray
-    Write-Host "  (Optional later: an NSFW subfolder for separate pics.)" -ForegroundColor DarkGray
+    Write-Host "  Folders named ignore-* (e.g. ignore-old) are skipped entirely." -ForegroundColor DarkGray
+    Write-Host "  NSFW\ is optional (Win+Shift-X)." -ForegroundColor DarkGray
     Write-Host ""
 
     if (Read-YesNo "Open a folder browser to pick it?" $true) {
@@ -385,6 +394,9 @@ Write-Host "  What we found:" -ForegroundColor White
 Write-Info "Normal (SFW) images : $($scan.SfwCount)"
 Write-Info "NSFW-path images    : $($scan.NsfwCount)  (any folder segment named NSFW)"
 Write-Info "Nested folders seen : $($scan.NestedDirs)  (max depth $script:ScanMaxDepth)"
+if ($scan.IgnoredDirs -gt 0) {
+    Write-Info "Ignored ignore-*    : $($scan.IgnoredDirs)"
+}
 Write-Info "Total usable        : $($scan.TotalSupported)"
 Write-Host ""
 
@@ -429,12 +441,6 @@ if ($WallpaperPath.StartsWith('\\')) {
 
 if ($WallpaperPath.Length -gt 200) {
     Write-Warn "Folder path is quite long ($($WallpaperPath.Length) chars)."
-    $warns++
-}
-
-$leaf = Split-Path -Leaf $WallpaperPath
-if ((Test-Path -LiteralPath (Join-Path $WallpaperPath $leaf) -PathType Container)) {
-    Write-Warn "There's a nested folder also named '$leaf' — images inside it are NOT scanned."
     $warns++
 }
 
@@ -574,16 +580,21 @@ Write-Host "  ===========================================" -ForegroundColor Dark
 Write-Host ""
 Write-Host "  Handy hotkeys" -ForegroundColor White
 Write-Host "  -------------------------------------------" -ForegroundColor DarkGray
-Write-Host "  Win+Shift-N / B   next / previous wallpaper  (hold to keep going)"
+Write-Host "  Win+Shift-N / B   next / previous on the monitor under the cursor (hold to keep going)"
 Write-Host "  Win+Alt-P         pause / resume auto-rotate"
+Write-Host "  Win+Alt-U         auto-rotate: All monitors / Round robin / Random"
 Write-Host "  Win+Shift-X       NSFW mode (Off / Combined / Only)"
 Write-Host "  Win+Shift-L       cycle favorites only"
-Write-Host "  Win+Shift-A       save favorite"
+Write-Host "  Win+Shift-A       save favorite (cursor monitor)"
 Write-Host "  Win+Shift-C       clear favorites"
 Write-Host "  Win+Shift-Z       show/hide desktop icons"
-Write-Host "  Win+Shift-O       open current image in Explorer"
+Write-Host "  Win+Shift-O       open current image (cursor monitor) in Explorer"
 Write-Host "  Win+Alt-N         toast notifications on/off"
 Write-Host "  Win+Alt-Q         quit"
+Write-Host ""
+Write-Host "  Multi-monitor: each screen gets its own image. Next/prev/fav/Explorer" -ForegroundColor DarkGray
+Write-Host "  follow the cursor. Win+Alt-U only changes how the auto-rotate timer behaves." -ForegroundColor DarkGray
+Write-Host "  Skip a folder in your library by renaming it ignore-* (ignore-old, Ignore-WIP, ...)." -ForegroundColor DarkGray
 Write-Host ""
 Write-Host "  Settings & favorites save automatically to:" -ForegroundColor DarkGray
 Write-Host "    $(Join-Path $WallpaperPath 'BackgroundHotkeyThing.ini')" -ForegroundColor DarkGray
